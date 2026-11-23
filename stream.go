@@ -9,6 +9,7 @@ import (
 	"iter"
 	"math"
 	"reflect"
+	"slices"
 )
 
 // Writer writes a stream of length-delimited protobuf records. Use NewWriter
@@ -53,9 +54,9 @@ func (w *Writer) Write[T any](v *T) error {
 	}
 	w.buf = b
 	p := binary.AppendUvarint(w.prefix[:0], uint64(len(b)))
-	_, w.err = writeFull(w.dst, p)
+	w.err = writeFull(w.dst, p)
 	if w.err == nil && len(b) != 0 {
-		_, w.err = writeFull(w.dst, b)
+		w.err = writeFull(w.dst, b)
 	}
 	return w.err
 }
@@ -75,11 +76,29 @@ func (w *Writer) WriteRawFrom(src io.Reader, size int64) error {
 		return fmt.Errorf("protobuf: record size %d is outside 0..%d bytes", size, maxRecordSize)
 	}
 	p := binary.AppendUvarint(w.prefix[:0], uint64(size))
-	_, w.err = writeFull(w.dst, p)
+	w.err = writeFull(w.dst, p)
 	if w.err == nil && size != 0 {
 		_, w.err = copyRecord(w.dst, src, size)
 	}
 	return w.err
+}
+
+// DecodeError reports a failure to decode a record read by Reader.Read.
+type DecodeError struct {
+	// Raw is the encoded record. The caller owns these bytes.
+	Raw RawMessage
+	// Err is the underlying decoding error.
+	Err error
+}
+
+// Error describes the decoding failure.
+func (e *DecodeError) Error() string {
+	return "protobuf: decode record: " + e.Err.Error()
+}
+
+// Unwrap returns the underlying decoding error.
+func (e *DecodeError) Unwrap() error {
+	return e.Err
 }
 
 // Reader reads length-delimited protobuf records and can decode them into
@@ -89,7 +108,6 @@ type Reader struct {
 	src     *bufio.Reader
 	schemas schemaCache
 	buf     []byte
-	record  RawMessage
 	err     error
 }
 
@@ -104,8 +122,8 @@ func NewReader(r io.Reader) (*Reader, error) {
 
 // Read replaces dst with the next decoded record and passes through errors
 // from the record source. An error leaves dst unchanged. If decoding fails,
-// the same record stays pending for retry with a compatible type. Decoded
-// values remain valid after subsequent reads.
+// Read returns a *DecodeError and advances to the following record. Decoded
+// values and the bytes in a DecodeError remain valid after subsequent reads.
 func (r *Reader) Read[T any](dst *T) error {
 	if dst == nil {
 		return errors.New("protobuf: nil record destination")
@@ -119,27 +137,27 @@ func (r *Reader) Read[T any](dst *T) error {
 		return err
 	}
 	if err := m.unmarshal(b, reflect.ValueOf(dst).Elem()); err != nil {
-		r.record = b
-		return fmt.Errorf("protobuf: decode record: %w", err)
+		if r.fitsInputBuffer(len(b)) {
+			b = slices.Clone(b)
+		} else {
+			// ReadRaw used r.buf. Transfer it to the caller.
+			r.buf = nil
+			b = slices.Clip(b)
+		}
+		return &DecodeError{Raw: b, Err: err}
 	}
 	return nil
 }
 
-// ReadRaw returns the next encoded record, including a record pending
-// after a failed Read. Its read-only bytes are valid until the next read
-// or until the source closes. It buffers the whole record. A clean end of
-// stream returns io.EOF. Framing and source errors are terminal.
+// ReadRaw returns the next encoded record. Its read-only bytes are valid
+// until the next read or until the source closes. It buffers the whole record.
+// A clean end of stream returns io.EOF. Framing and source errors are terminal.
 func (r *Reader) ReadRaw() (RawMessage, error) {
-	if r.record != nil {
-		b := r.record
-		r.record = nil
-		return b, nil
-	}
 	n, err := r.readSize()
 	if err != nil {
 		return nil, err
 	}
-	if n <= r.src.Size() {
+	if r.fitsInputBuffer(n) {
 		return r.readChunk(n)
 	}
 	b := r.buf[:0]
@@ -154,22 +172,13 @@ func (r *Reader) ReadRaw() (RawMessage, error) {
 	return r.buf, nil
 }
 
-// ReadRawTo copies the next encoded record, including one pending after
-// a failed Read, to dst. It returns the number of message bytes written and
-// uses bounded working memory. Pass io.Discard to skip a record. A clean end
-// of stream returns io.EOF. Framing, source and destination errors are terminal.
+// ReadRawTo copies the next encoded record to dst and returns the number of
+// message bytes written. It uses bounded working memory. Pass io.Discard to
+// skip a record. A clean end of stream returns io.EOF. Framing, source and
+// destination errors are terminal.
 func (r *Reader) ReadRawTo(dst io.Writer) (int64, error) {
 	if dst == nil {
 		return 0, errors.New("protobuf: nil record destination")
-	}
-	if r.record != nil {
-		b := r.record
-		r.record = nil
-		n, err := writeFull(dst, b)
-		if err != nil {
-			r.err = fmt.Errorf("protobuf: copy record: %w", err)
-		}
-		return int64(n), r.err
 	}
 	n, err := r.readSize()
 	if err != nil || n == 0 {
@@ -197,6 +206,10 @@ func (r *Reader) RawMessages() iter.Seq2[RawMessage, error] {
 }
 
 const maxRecordSize = math.MaxInt32
+
+func (r *Reader) fitsInputBuffer(n int) bool {
+	return n <= r.src.Size()
+}
 
 func (r *Reader) readSize() (int, error) {
 	if r.err != nil {
@@ -262,12 +275,12 @@ func (c *schemaCache) lookupFor[T any]() (*message, error) {
 	return m, nil
 }
 
-func writeFull(w io.Writer, b []byte) (int, error) {
+func writeFull(w io.Writer, b []byte) error {
 	n, err := w.Write(b)
 	if err == nil && n != len(b) {
-		err = io.ErrShortWrite
+		return io.ErrShortWrite
 	}
-	return n, err
+	return err
 }
 
 func copyRecord(dst io.Writer, src io.Reader, size int64) (int64, error) {
