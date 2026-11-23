@@ -19,10 +19,9 @@
 // nil. Repeated message elements may be values or non-nil pointers. Keep field
 // numbers and their wire types stable across revisions.
 //
-// Writer and Reader store streams of one message type in independently
-// compressed Zstandard pages. Each page contains length-prefixed protobuf
-// messages, and the caller supplies the message type when writing or reading
-// a stream.
+// Writer and Reader encode and decode streams of complete protobuf records.
+// Their source and destination can be provided by the page subpackage for
+// independently compressed Zstandard storage.
 package protobuf
 
 import (

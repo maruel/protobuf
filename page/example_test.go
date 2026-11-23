@@ -1,4 +1,4 @@
-package protobuf_test
+package page_test
 
 import (
 	"errors"
@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/maruel/protobuf"
+	"github.com/maruel/protobuf/page"
 )
 
 func ExampleWriter() {
@@ -30,26 +31,34 @@ func ExampleWriter() {
 		}
 	}()
 
-	w, err := protobuf.NewWriter[Event](f, 0)
+	pw, err := page.NewWriter(f, 0)
 	if err != nil {
 		panic(err)
 	}
-	if err := errors.Join(w.Write(&Event{Sequence: 1, Text: "started"}), w.Close()); err != nil {
+	w, err := protobuf.NewWriter[Event](pw)
+	if err != nil {
+		panic(errors.Join(err, pw.Close()))
+	}
+	if err := errors.Join(w.Write(&Event{Sequence: 1, Text: "started"}), pw.Close()); err != nil {
 		panic(err)
 	}
 
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		panic(err)
 	}
-	r, err := protobuf.NewReader(f)
+	pr, err := page.NewReader(f)
 	if err != nil {
 		panic(err)
 	}
 	defer func() {
-		if err := r.Close(); err != nil {
+		if err := pr.Close(); err != nil {
 			panic(err)
 		}
 	}()
+	r, err := protobuf.NewReader(pr)
+	if err != nil {
+		panic(err)
+	}
 	for event, err := range r.Events[Event]() {
 		if err != nil {
 			panic(err)
