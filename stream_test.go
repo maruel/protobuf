@@ -203,6 +203,21 @@ func TestReader(t *testing.T) {
 		t.Parallel()
 		t.Run("valid", func(t *testing.T) {
 			t.Parallel()
+			t.Run("continues after EOF", func(t *testing.T) {
+				t.Parallel()
+				var src bytes.Buffer
+				r, err := NewReader(&src)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := r.ReadRaw(); err != io.EOF { //nolint:errorlint // A clean end of stream returns the exact EOF sentinel.
+					t.Fatalf("ReadRaw returned %v, want io.EOF", err)
+				}
+				src.Write([]byte{2, 0x08, 7})
+				if got, err := r.ReadRaw(); err != nil || !bytes.Equal(got, []byte{0x08, 7}) {
+					t.Fatalf("ReadRaw after EOF = %x, %v, want 0807, nil", got, err)
+				}
+			})
 			t.Run("large buffered message", func(t *testing.T) {
 				t.Parallel()
 				b := bytes.Repeat([]byte{0x08, 7}, 4369)
@@ -271,9 +286,6 @@ func TestReader(t *testing.T) {
 					checkErrorContains(t, err, tt.want)
 					if m != nil {
 						t.Fatalf("ReadRaw returned a partial message %x", m)
-					}
-					if n, retry := r.ReadRawTo(io.Discard); n != 0 || !errors.Is(retry, err) {
-						t.Fatalf("ReadRawTo after failed ReadRaw = %d, %v, want 0, %v", n, retry, err)
 					}
 				})
 			}
@@ -372,9 +384,6 @@ func TestReader(t *testing.T) {
 				if n != 2 || !errors.Is(err, io.ErrUnexpectedEOF) || dst.String() != "\x08\x07" {
 					t.Fatalf("truncated record = %d, %v, bytes %x", n, err, dst.Bytes())
 				}
-				if got, retry := r.ReadRaw(); got != nil || !errors.Is(retry, err) {
-					t.Fatalf("ReadRaw after failed copy = %x, %v, want nil, %v", got, retry, err)
-				}
 			})
 			t.Run("destination error with full count", func(t *testing.T) {
 				t.Parallel()
@@ -387,8 +396,8 @@ func TestReader(t *testing.T) {
 				if n != 2 || !errors.Is(err, io.EOF) || err == io.EOF { //nolint:errorlint // A destination EOF cannot end iteration cleanly.
 					t.Fatalf("ReadRawTo = %d, %v, want two bytes and wrapped EOF", n, err)
 				}
-				if got, retry := r.ReadRaw(); got != nil || !errors.Is(retry, err) {
-					t.Fatalf("ReadRaw after failed copy = %x, %v, want nil, %v", got, retry, err)
+				if got, err := r.ReadRaw(); err != nil || !bytes.Equal(got, []byte{0x08, 9}) {
+					t.Fatalf("ReadRaw after destination error = %x, %v, want 0809, nil", got, err)
 				}
 			})
 			t.Run("short destination write", func(t *testing.T) {
@@ -401,9 +410,6 @@ func TestReader(t *testing.T) {
 				n, err := r.ReadRawTo(w)
 				if n != 1 || !errors.Is(err, io.ErrShortWrite) {
 					t.Fatalf("ReadRawTo = %d, %v, want one byte and io.ErrShortWrite", n, err)
-				}
-				if got, retry := r.ReadRaw(); got != nil || !errors.Is(retry, err) {
-					t.Fatalf("ReadRaw after failed copy = %x, %v, want nil, %v", got, retry, err)
 				}
 			})
 		})
@@ -451,7 +457,15 @@ func TestReader(t *testing.T) {
 		t.Run("error", func(t *testing.T) {
 			t.Parallel()
 			wrapped := fmt.Errorf("reading record from storage: %w", io.EOF)
-			r, err := NewReader(readerFunc(func([]byte) (int, error) { return 0, wrapped }))
+			src := framedRecords([]byte{0x08, 7})
+			fail := true
+			r, err := NewReader(readerFunc(func(p []byte) (int, error) {
+				if fail {
+					fail = false
+					return 0, wrapped
+				}
+				return src.Read(p)
+			}))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -464,6 +478,9 @@ func TestReader(t *testing.T) {
 			}
 			if n != 1 {
 				t.Fatalf("RawMessages yielded %d results, want one", n)
+			}
+			if got, err := r.ReadRaw(); err != nil || !bytes.Equal(got, []byte{0x08, 7}) {
+				t.Fatalf("ReadRaw after source error = %x, %v, want 0807, nil", got, err)
 			}
 		})
 	})
