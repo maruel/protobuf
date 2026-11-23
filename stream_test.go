@@ -132,16 +132,24 @@ func TestWriter(t *testing.T) {
 				if !errors.Is(err, io.ErrUnexpectedEOF) {
 					t.Fatalf("WriteRawFrom = %v, want io.ErrUnexpectedEOF", err)
 				}
-				if err := w.Write(&streamEvent{Seq: 7}); !errors.Is(err, io.ErrUnexpectedEOF) {
-					t.Fatalf("Write after failed transfer = %v, want io.ErrUnexpectedEOF", err)
-				}
 				if want := []byte{0xff, 0xff, 0xff, 0xff, 0x07, 0x08}; !bytes.Equal(dst.Bytes(), want) {
 					t.Fatalf("partial stream = %x, want %x", dst.Bytes(), want)
+				}
+				dst.Reset()
+				if err := w.Write(&streamEvent{Seq: 7}); err != nil || dst.String() != "\x02\x08\x07" {
+					t.Fatalf("Write after resetting the destination = %x, %v", dst.Bytes(), err)
 				}
 			})
 			t.Run("short prefix write", func(t *testing.T) {
 				t.Parallel()
-				w, err := NewWriter(writerFunc(func([]byte) (int, error) { return 0, nil }))
+				var dst bytes.Buffer
+				fail := true
+				w, err := NewWriter(writerFunc(func(b []byte) (int, error) {
+					if fail {
+						return 0, nil
+					}
+					return dst.Write(b)
+				}))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -150,7 +158,11 @@ func TestWriter(t *testing.T) {
 				}
 				src := strings.NewReader("\x08\x07")
 				if err := w.WriteRawFrom(src, 2); !errors.Is(err, io.ErrShortWrite) || src.Len() != 2 {
-					t.Fatalf("WriteRawFrom after failed write = %v with %d unread", err, src.Len())
+					t.Fatalf("WriteRawFrom with a short prefix write = %v with %d unread", err, src.Len())
+				}
+				fail = false
+				if err := w.WriteRawFrom(src, 2); err != nil || src.Len() != 0 || dst.String() != "\x02\x08\x07" {
+					t.Fatalf("WriteRawFrom retry = %x, %v with %d unread", dst.Bytes(), err, src.Len())
 				}
 			})
 		})

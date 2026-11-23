@@ -19,7 +19,6 @@ type Writer struct {
 	schemas schemaCache
 	buf     []byte
 	prefix  [binary.MaxVarintLen32]byte
-	err     error
 }
 
 // NewWriter creates a writer over w. The caller owns the destination,
@@ -33,11 +32,9 @@ func NewWriter(w io.Writer) (*Writer, error) {
 
 // Write encodes a non-nil pointer to a named struct as one record. It
 // validates the struct type and buffers the encoded message. An encoding
-// error leaves the destination untouched. A destination error is terminal.
+// error leaves the destination untouched. A write error can leave a partial
+// record in the destination.
 func (w *Writer) Write[T any](v *T) error {
-	if w.err != nil {
-		return w.err
-	}
 	if v == nil {
 		return errors.New("protobuf: nil record")
 	}
@@ -54,21 +51,17 @@ func (w *Writer) Write[T any](v *T) error {
 	}
 	w.buf = b
 	p := binary.AppendUvarint(w.prefix[:0], uint64(len(b)))
-	w.err = writeFull(w.dst, p)
-	if w.err == nil && len(b) != 0 {
-		w.err = writeFull(w.dst, b)
+	if err := writeFull(w.dst, p); err != nil || len(b) == 0 {
+		return err
 	}
-	return w.err
+	return writeFull(w.dst, b)
 }
 
 // WriteRawFrom copies size bytes of an already encoded message from src
 // as one record. It uses bounded working memory and leaves any trailing bytes
 // in src unread. If src ends early, it returns io.ErrUnexpectedEOF. A read or
-// write error is terminal.
+// write error can leave a partial record in the destination.
 func (w *Writer) WriteRawFrom(src io.Reader, size int64) error {
-	if w.err != nil {
-		return w.err
-	}
 	if src == nil {
 		return errors.New("protobuf: nil record source")
 	}
@@ -76,11 +69,11 @@ func (w *Writer) WriteRawFrom(src io.Reader, size int64) error {
 		return fmt.Errorf("protobuf: record size %d is outside 0..%d bytes", size, maxRecordSize)
 	}
 	p := binary.AppendUvarint(w.prefix[:0], uint64(size))
-	w.err = writeFull(w.dst, p)
-	if w.err == nil && size != 0 {
-		_, w.err = copyRecord(w.dst, src, size)
+	if err := writeFull(w.dst, p); err != nil || size == 0 {
+		return err
 	}
-	return w.err
+	_, err := copyRecord(w.dst, src, size)
+	return err
 }
 
 // DecodeError reports a failure to decode a record read by Reader.Read.
