@@ -39,15 +39,10 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-// Marshal returns the proto3 encoding of a named struct or a non-nil pointer
-// to one.
-func Marshal(v any) ([]byte, error) {
-	return Append(nil, v)
-}
-
-// Append appends a struct's proto3 encoding to dst. On error it returns dst at
-// its original length. The message can be a named struct or a non-nil pointer
-// to one. Keep the appended region disjoint from the message's byte fields.
+// Append appends a struct's proto3 encoding to dst. Pass nil to start with an
+// empty destination. On error it returns dst at its original length. The
+// message can be a named struct or a non-nil pointer to one. Keep the appended
+// region disjoint from the message's byte fields.
 func Append(dst []byte, v any) ([]byte, error) {
 	rv := reflect.Indirect(reflect.ValueOf(v))
 	if !rv.IsValid() {

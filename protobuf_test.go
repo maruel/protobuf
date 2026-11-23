@@ -44,7 +44,7 @@ type recursiveEvent struct {
 	Next *recursiveEvent `protobuf:"1"`
 }
 
-func TestMarshal(t *testing.T) {
+func TestAppend(t *testing.T) {
 	t.Parallel()
 	t.Run("valid", func(t *testing.T) {
 		t.Parallel()
@@ -53,12 +53,12 @@ func TestMarshal(t *testing.T) {
 			want, v := wireFixture(t)
 			v.Ignored = "not serialized"
 			v.Omitted = "not serialized"
-			got, err := Marshal(&v)
+			got, err := Append(nil, &v)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(got, want) {
-				t.Fatalf("Marshal = %x, want %x", got, want)
+				t.Fatalf("Append = %x, want %x", got, want)
 			}
 		})
 		t.Run("multibyte length prefixes", func(t *testing.T) {
@@ -67,7 +67,7 @@ func TestMarshal(t *testing.T) {
 				Detail wireDetail `protobuf:"1"`
 				Counts []int32    `protobuf:"2"`
 			}
-			b, err := Marshal(largeEvent{Detail: wireDetail{Text: strings.Repeat("x", 128)}, Counts: make([]int32, 130)})
+			b, err := Append(nil, largeEvent{Detail: wireDetail{Text: strings.Repeat("x", 128)}, Counts: make([]int32, 130)})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -76,41 +76,24 @@ func TestMarshal(t *testing.T) {
 			want = append(want, 0x12, 0x82, 0x01)
 			want = append(want, make([]byte, 130)...)
 			if !bytes.Equal(b, want) {
-				t.Fatalf("Marshal = %x, want %x", b, want)
+				t.Fatalf("Append = %x, want %x", b, want)
 			}
 		})
-	})
-	t.Run("error", func(t *testing.T) {
-		t.Parallel()
-		t.Run("cyclic message", func(t *testing.T) {
+		t.Run("non-empty destination", func(t *testing.T) {
 			t.Parallel()
-			var v recursiveEvent
-			v.Next = &v
-			_, err := Marshal(&v)
-			checkErrorContains(t, err, "message nesting exceeds 100")
+			got, err := Append([]byte{0xff}, wireDetail{Code: 42})
+			if err != nil || !bytes.Equal(got, []byte{0xff, 0x08, 0x2a}) {
+				t.Fatalf("Append = %x, %v", got, err)
+			}
 		})
-		t.Run("nil repeated message", func(t *testing.T) {
-			t.Parallel()
-			_, err := Marshal(wireEvent{Messages: []*wireDetail{nil}})
-			checkErrorContains(t, err, "messages: nil message at index 0")
-		})
-	})
-}
-
-func TestAppend(t *testing.T) {
-	t.Parallel()
-	t.Run("valid", func(t *testing.T) {
-		t.Parallel()
-		got, err := Append([]byte{0xff}, wireDetail{Code: 42})
-		if err != nil || !bytes.Equal(got, []byte{0xff, 0x08, 0x2a}) {
-			t.Fatalf("Append = %x, %v", got, err)
-		}
 	})
 	t.Run("error", func(t *testing.T) {
 		t.Parallel()
 		type labeledEvent struct {
 			Labels []string `protobuf:"1"`
 		}
+		var cycle recursiveEvent
+		cycle.Next = &cycle
 		for _, c := range []struct {
 			name string
 			v    any
@@ -118,6 +101,8 @@ func TestAppend(t *testing.T) {
 		}{
 			{name: "nil message", v: (*wireDetail)(nil), err: "expected a named struct or non-nil pointer"},
 			{name: "non-message value", v: true, err: "not a named struct"},
+			{name: "cyclic message", v: &cycle, err: "message nesting exceeds 100"},
+			{name: "nil repeated message", v: wireEvent{Messages: []*wireDetail{nil}}, err: "messages: nil message at index 0"},
 			{name: "invalid repeated string after a valid element", v: labeledEvent{Labels: []string{"ok", "\xff"}}, err: "Labels: invalid UTF-8"},
 		} {
 			t.Run(c.name, func(t *testing.T) {
@@ -548,40 +533,37 @@ func TestRawMessage(t *testing.T) {
 	})
 }
 
-func BenchmarkMarshal(b *testing.B) {
-	v := benchmarkWireEvent()
-	data, err := Marshal(&v)
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.SetBytes(int64(len(data)))
-	b.ReportAllocs()
-	for b.Loop() {
-		if _, err := Marshal(&v); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
 func BenchmarkAppend(b *testing.B) {
 	v := benchmarkWireEvent()
 	buf, err := Append(nil, &v)
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.SetBytes(int64(len(buf)))
-	b.ReportAllocs()
-	for b.Loop() {
-		buf, err = Append(buf[:0], &v)
-		if err != nil {
-			b.Fatal(err)
+	n := int64(len(buf))
+	b.Run("fresh", func(b *testing.B) {
+		b.SetBytes(n)
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := Append(nil, &v); err != nil {
+				b.Fatal(err)
+			}
 		}
-	}
+	})
+	b.Run("reuse", func(b *testing.B) {
+		b.SetBytes(n)
+		b.ReportAllocs()
+		for b.Loop() {
+			buf, err = Append(buf[:0], &v)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func BenchmarkUnmarshal(b *testing.B) {
 	v := benchmarkWireEvent()
-	data, err := Marshal(&v)
+	data, err := Append(nil, &v)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -598,7 +580,7 @@ func BenchmarkUnmarshal(b *testing.B) {
 func BenchmarkRawMessage(b *testing.B) {
 	b.Run("DecodeField", func(b *testing.B) {
 		v := benchmarkWireEvent()
-		data, err := Marshal(&v)
+		data, err := Append(nil, &v)
 		if err != nil {
 			b.Fatal(err)
 		}

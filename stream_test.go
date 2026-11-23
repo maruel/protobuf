@@ -741,7 +741,7 @@ func benchmarkEvents(b *testing.B) (events []streamEvent, payloadBytes int64) {
 		e.Text = names[i%len(names)]
 		e.Data = fmt.Appendf(nil, `{"service":"ingest","path":"/v1/events","method":"POST","region":"us-east-1","host":"ingest-%02d","request_id":"%08x","duration_ms":%d}`,
 			i%32, uint32(i)*0x9e3779b1, i%1000)
-		data, err := Marshal(e)
+		data, err := Append(nil, e)
 		if err != nil {
 			b.Fatal(err)
 		}
