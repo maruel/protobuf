@@ -24,12 +24,9 @@ type Writer struct {
 	prefix  [binary.MaxVarintLen32]byte
 }
 
-// NewWriter creates a writer over w.
-func NewWriter(w io.Writer) (*Writer, error) {
-	if w == nil {
-		return nil, errors.New("protobuf: nil record writer")
-	}
-	return &Writer{Dst: w}, nil
+// NewWriter creates a writer over w, which must be non-nil.
+func NewWriter(w io.Writer) *Writer {
+	return &Writer{Dst: w}
 }
 
 // Write encodes a non-nil pointer to a named struct as one record. It
@@ -112,13 +109,11 @@ type Reader struct {
 	buf     []byte
 }
 
-// NewReader creates a reader over r. The reader may buffer ahead. The caller
-// owns the source and keeps it open for the reader's exclusive use.
-func NewReader(r io.Reader) (*Reader, error) {
-	if r == nil {
-		return nil, errors.New("protobuf: nil record reader")
-	}
-	return &Reader{Src: bufio.NewReader(r)}, nil
+// NewReader creates a reader over r, which must be non-nil. The reader may
+// buffer ahead. The caller owns the source and keeps it open for the reader's
+// exclusive use.
+func NewReader(r io.Reader) *Reader {
+	return &Reader{Src: bufio.NewReader(r)}
 }
 
 // Read replaces dst with the next decoded record and passes through errors
@@ -150,9 +145,11 @@ func (r *Reader) Read[T any](dst *T) error {
 	return nil
 }
 
-// ReadRaw returns the next encoded record and buffers it in full. Its read-only
-// bytes are valid until the next read, until Src is reset or replaced, or until
-// the source closes. A clean end of stream returns io.EOF.
+// ReadRaw buffers the next record in full and returns its encoded bytes.
+// Use ReadRawTo to copy a record with bounded working memory.
+//
+// The read-only bytes are valid until the next read, until Src is reset or
+// replaced, or until the source closes. A clean end of stream returns io.EOF.
 func (r *Reader) ReadRaw() (RawMessage, error) {
 	n, err := r.readSize()
 	if err != nil {
@@ -191,9 +188,11 @@ func (r *Reader) ReadRawTo(dst io.Writer) (int64, error) {
 	return c, nil
 }
 
-// RawMessages iterates over the remaining encoded messages. It shares the
-// cursor and the borrowed byte lifetime of ReadRaw. Each iteration yields a
-// non-EOF error once with a nil message and stops.
+// RawMessages returns a single-use iterator over the remaining encoded records.
+// Restarting the iterator resumes at the reader's current position. Each
+// record is buffered in full and its bytes have the same lifetime as a result
+// of ReadRaw. It stops at a clean EOF. On any other error, it yields a nil
+// message and the error, then stops.
 func (r *Reader) RawMessages() iter.Seq2[RawMessage, error] {
 	return func(yield func(RawMessage, error) bool) {
 		for {

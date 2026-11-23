@@ -35,10 +35,7 @@ func ExampleWriter() {
 	if err != nil {
 		panic(err)
 	}
-	w, err := protobuf.NewWriter(pw)
-	if err != nil {
-		panic(errors.Join(err, pw.Close()))
-	}
+	w := protobuf.NewWriter(pw)
 	if err := errors.Join(w.Write(&Event{Sequence: 1, Text: "started"}), pw.Close()); err != nil {
 		panic(err)
 	}
@@ -55,10 +52,7 @@ func ExampleWriter() {
 			panic(err)
 		}
 	}()
-	r, err := protobuf.NewReader(pr)
-	if err != nil {
-		panic(err)
-	}
+	r := protobuf.NewReader(pr)
 	for raw, err := range r.RawMessages() {
 		if err != nil {
 			panic(err)
