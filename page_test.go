@@ -21,9 +21,13 @@ type pageEvent struct {
 }
 
 func TestWriter(t *testing.T) {
+	t.Parallel()
 	t.Run("Write", func(t *testing.T) {
+		t.Parallel()
 		t.Run("valid", func(t *testing.T) {
+			t.Parallel()
 			t.Run("multi-page file", func(t *testing.T) {
+				t.Parallel()
 				f, err := os.Create(filepath.Join(t.TempDir(), "events.pbz"))
 				if err != nil {
 					t.Fatal(err)
@@ -81,7 +85,9 @@ func TestWriter(t *testing.T) {
 		})
 
 		t.Run("error", func(t *testing.T) {
+			t.Parallel()
 			t.Run("invalid input preserves pending events", func(t *testing.T) {
+				t.Parallel()
 				var b bytes.Buffer
 				w, err := NewWriter[pageEvent](&b, 1)
 				if err != nil {
@@ -111,6 +117,7 @@ func TestWriter(t *testing.T) {
 				checkPageRecords(t, r, want)
 			})
 			t.Run("short write during rollover is terminal", func(t *testing.T) {
+				t.Parallel()
 				var dst shortPageWriter
 				w, err := NewWriter[pageEvent](&dst, 3)
 				if err != nil {
@@ -156,7 +163,9 @@ func TestWriter(t *testing.T) {
 	})
 
 	t.Run("Close", func(t *testing.T) {
+		t.Parallel()
 		t.Run("valid", func(t *testing.T) {
+			t.Parallel()
 			var b bytes.Buffer
 			w, err := NewWriter[pageEvent](&b, 0)
 			if err != nil {
@@ -170,6 +179,7 @@ func TestWriter(t *testing.T) {
 			}
 		})
 		t.Run("error", func(t *testing.T) {
+			t.Parallel()
 			w, err := NewWriter[pageEvent](io.Discard, 0)
 			if err != nil {
 				t.Fatal(err)
@@ -187,7 +197,9 @@ func TestWriter(t *testing.T) {
 }
 
 func TestNewWriter(t *testing.T) {
+	t.Parallel()
 	t.Run("error", func(t *testing.T) {
+		t.Parallel()
 		_, err := NewWriter[pageEvent](nil, 0)
 		checkErrorContains(t, err, "nil page writer destination")
 		_, err = NewWriter[pageEvent](io.Discard, -1)
@@ -200,16 +212,22 @@ func TestNewWriter(t *testing.T) {
 }
 
 func TestNewReader(t *testing.T) {
+	t.Parallel()
 	t.Run("error", func(t *testing.T) {
+		t.Parallel()
 		_, err := NewReader(nil)
 		checkErrorContains(t, err, "nil page reader source")
 	})
 }
 
 func TestReader(t *testing.T) {
+	t.Parallel()
 	t.Run("Read", func(t *testing.T) {
+		t.Parallel()
 		t.Run("error", func(t *testing.T) {
+			t.Parallel()
 			t.Run("invalid destinations can be retried", func(t *testing.T) {
+				t.Parallel()
 				r, err := NewReader(bytes.NewReader(pageFixture(t)))
 				if err != nil {
 					t.Fatal(err)
@@ -229,6 +247,7 @@ func TestReader(t *testing.T) {
 				checkPageRecords(t, r, []pageEvent{{Seq: 7}, {}, {Seq: 9}})
 			})
 			t.Run("malformed message stays pending", func(t *testing.T) {
+				t.Parallel()
 				// The record contains only its field tag and omits the value.
 				record := decodePageFixture(t, "504250010f0000000200000028b52ffd045811000001082bca2162")
 				r, err := NewReader(bytes.NewReader(record))
@@ -276,6 +295,7 @@ func TestReader(t *testing.T) {
 				{name: "malformed length", data: length, is: io.ErrUnexpectedEOF, msg: "read record length"},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
 					r, err := NewReader(bytes.NewReader(tc.data))
 					if err != nil {
 						t.Fatal(err)
@@ -287,7 +307,7 @@ func TestReader(t *testing.T) {
 						t.Fatalf("Read returned %v, want %v", first, tc.is)
 					}
 					checkErrorContains(t, first, tc.msg)
-					if err := r.Read(&e); err != first {
+					if err := r.Read(&e); err != first { //nolint:errorlint // A terminal error is returned unchanged.
 						t.Fatalf("Read after a terminal error returned %v, want %v", err, first)
 					}
 					if e.Seq != 77 {
@@ -299,7 +319,9 @@ func TestReader(t *testing.T) {
 	})
 
 	t.Run("Close", func(t *testing.T) {
+		t.Parallel()
 		t.Run("error", func(t *testing.T) {
+			t.Parallel()
 			r, err := NewReader(bytes.NewReader(pageFixture(t)))
 			if err != nil {
 				t.Fatal(err)
@@ -321,7 +343,9 @@ func TestReader(t *testing.T) {
 	})
 
 	t.Run("Events", func(t *testing.T) {
+		t.Parallel()
 		t.Run("valid", func(t *testing.T) {
+			t.Parallel()
 			r, err := NewReader(bytes.NewReader(pageFixture(t)))
 			if err != nil {
 				t.Fatal(err)
@@ -358,6 +382,7 @@ func TestReader(t *testing.T) {
 		})
 
 		t.Run("error", func(t *testing.T) {
+			t.Parallel()
 			r, err := NewReader(bytes.NewReader(pageFixture(t)[:4]))
 			if err != nil {
 				t.Fatal(err)
@@ -467,10 +492,9 @@ func BenchmarkReader(b *testing.B) {
 // pageBenchmarkEvents returns a batch and its uncompressed protobuf payload
 // size. Recurring event types and distinct request IDs model a request log.
 // Each batch is flushed, so its last page can be smaller than the target.
-func pageBenchmarkEvents(b *testing.B) ([]pageEvent, int64) {
+func pageBenchmarkEvents(b *testing.B) (events []pageEvent, payloadBytes int64) {
 	names := [...]string{"request started", "request completed", "request retried"}
-	events := make([]pageEvent, 2048)
-	var n int64
+	events = make([]pageEvent, 2048)
 	for i := range events {
 		e := &events[i]
 		e.Seq = uint64(i + 1)
@@ -481,13 +505,14 @@ func pageBenchmarkEvents(b *testing.B) ([]pageEvent, int64) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		n += int64(len(data))
+		payloadBytes += int64(len(data))
 	}
-	return events, n
+	return events, payloadBytes
 }
 
 type shortPageWriter struct {
 	bytes.Buffer
+
 	truncateNext bool
 }
 
@@ -523,7 +548,7 @@ func checkPageRecords(t *testing.T, r *Reader, want []pageEvent) {
 		}
 	}
 	var last pageEvent
-	if err := r.Read(&last); err != io.EOF {
+	if err := r.Read(&last); err != io.EOF { //nolint:errorlint // A clean page boundary returns the exact EOF sentinel.
 		t.Fatalf("after reading %d records, Read returned %v, want io.EOF", len(want), err)
 	}
 }

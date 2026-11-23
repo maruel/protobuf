@@ -44,8 +44,11 @@ type recursiveEvent struct {
 }
 
 func TestMarshal(t *testing.T) {
+	t.Parallel()
 	t.Run("valid", func(t *testing.T) {
+		t.Parallel()
 		t.Run("protoc", func(t *testing.T) {
+			t.Parallel()
 			want, v := wireFixture(t)
 			v.Ignored = "not serialized"
 			v.Omitted = "not serialized"
@@ -58,6 +61,7 @@ func TestMarshal(t *testing.T) {
 			}
 		})
 		t.Run("multibyte length prefixes", func(t *testing.T) {
+			t.Parallel()
 			type largeEvent struct {
 				Detail wireDetail `protobuf:"1"`
 				Counts []int32    `protobuf:"2"`
@@ -76,13 +80,16 @@ func TestMarshal(t *testing.T) {
 		})
 	})
 	t.Run("error", func(t *testing.T) {
+		t.Parallel()
 		t.Run("cyclic message", func(t *testing.T) {
+			t.Parallel()
 			var v recursiveEvent
 			v.Next = &v
 			_, err := Marshal(&v)
 			checkErrorContains(t, err, "message nesting exceeds 100")
 		})
 		t.Run("nil repeated message", func(t *testing.T) {
+			t.Parallel()
 			_, err := Marshal(wireEvent{Messages: []*wireDetail{nil}})
 			checkErrorContains(t, err, "messages: nil message at index 0")
 		})
@@ -90,13 +97,16 @@ func TestMarshal(t *testing.T) {
 }
 
 func TestAppend(t *testing.T) {
+	t.Parallel()
 	t.Run("valid", func(t *testing.T) {
+		t.Parallel()
 		got, err := Append([]byte{0xff}, wireDetail{Code: 42})
 		if err != nil || !bytes.Equal(got, []byte{0xff, 0x08, 0x2a}) {
 			t.Fatalf("Append = %x, %v", got, err)
 		}
 	})
 	t.Run("error", func(t *testing.T) {
+		t.Parallel()
 		type labeledEvent struct {
 			Labels []string `protobuf:"1"`
 		}
@@ -110,6 +120,7 @@ func TestAppend(t *testing.T) {
 			{name: "invalid repeated string after a valid element", v: labeledEvent{Labels: []string{"ok", "\xff"}}, err: "Labels: invalid UTF-8"},
 		} {
 			t.Run(c.name, func(t *testing.T) {
+				t.Parallel()
 				b := make([]byte, 1, 32)
 				b[0] = 0xff
 				got, err := Append(b, c.v)
@@ -123,8 +134,11 @@ func TestAppend(t *testing.T) {
 }
 
 func TestUnmarshal(t *testing.T) {
+	t.Parallel()
 	t.Run("valid", func(t *testing.T) {
+		t.Parallel()
 		t.Run("protoc", func(t *testing.T) {
+			t.Parallel()
 			b, want := wireFixture(t)
 			got := wireEvent{Ignored: "old", Omitted: "old"}
 			if err := Unmarshal(b, &got); err != nil {
@@ -136,6 +150,7 @@ func TestUnmarshal(t *testing.T) {
 			}
 		})
 		t.Run("merged messages and mixed repeated encodings", func(t *testing.T) {
+			t.Parallel()
 			type oldEvent struct {
 				Detail *wireDetail `protobuf:"1"`
 				Counts []int32     `protobuf:"2"`
@@ -159,28 +174,39 @@ func TestUnmarshal(t *testing.T) {
 			}
 		})
 		t.Run("added field reads as zero", func(t *testing.T) {
+			t.Parallel()
 			got := wireDetail{Code: 99, Text: "old"}
 			if err := Unmarshal([]byte{0x08, 0x05}, &got); err != nil || got != (wireDetail{Code: 5}) {
 				t.Fatalf("Unmarshal = %+v, %v", got, err)
 			}
 		})
-		t.Run("minimum zigzag int32", func(t *testing.T) {
-			type zigzagEvent struct {
-				Delta int32 `protobuf:"1,zigzag"`
+		t.Run("minimum signed widths", func(t *testing.T) {
+			t.Parallel()
+			type signedEvent struct {
+				Delta   int32 `protobuf:"1,zigzag"`
+				Counter int64 `protobuf:"2"`
 			}
-			var got zigzagEvent
-			if err := Unmarshal([]byte{0x08, 0xff, 0xff, 0xff, 0xff, 0x0f}, &got); err != nil || got.Delta != math.MinInt32 {
-				t.Fatalf("Unmarshal = %+v, %v, want delta %d", got, err, math.MinInt32)
+			data := []byte{
+				0x08, 0xff, 0xff, 0xff, 0xff, 0x0f, // sint32 minimum
+				0x10, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, // int64 minimum
+			}
+			var got signedEvent
+			want := signedEvent{Delta: math.MinInt32, Counter: math.MinInt64}
+			if err := Unmarshal(data, &got); err != nil || got != want {
+				t.Fatalf("Unmarshal = %+v, %v, want %+v", got, err, want)
 			}
 		})
 	})
 	t.Run("error", func(t *testing.T) {
+		t.Parallel()
 		t.Run("invalid destination", func(t *testing.T) {
+			t.Parallel()
 			checkErrorContains(t, Unmarshal(nil, (*wireDetail)(nil)), "expected a non-nil pointer")
 			var dst bool
 			checkErrorContains(t, Unmarshal(nil, &dst), "not a named struct")
 		})
 		t.Run("truncated wire data leaves destination intact", func(t *testing.T) {
+			t.Parallel()
 			for _, c := range []struct {
 				name string
 				wire []byte
@@ -195,6 +221,7 @@ func TestUnmarshal(t *testing.T) {
 				{name: "submessage field value", wire: []byte{0x42, 1, 0x08}},
 			} {
 				t.Run(c.name, func(t *testing.T) {
+					t.Parallel()
 					b := append([]byte{0x08, 1}, c.wire...)
 					got := wireEvent{Counter: 7, Detail: &wireDetail{Code: 99, Text: "old"}}
 					want := wireEvent{Counter: 7, Detail: &wireDetail{Code: 99, Text: "old"}}
@@ -208,17 +235,20 @@ func TestUnmarshal(t *testing.T) {
 			}
 		})
 		t.Run("field number exceeds protobuf limit", func(t *testing.T) {
+			t.Parallel()
 			var got wireDetail
 			// Field number 2^29, one above the wire limit, followed by value 1.
 			err := Unmarshal([]byte{0x80, 0x80, 0x80, 0x80, 0x10, 1}, &got)
 			checkErrorContains(t, err, "invalid field number 536870912")
 		})
 		t.Run("invalid UTF-8", func(t *testing.T) {
+			t.Parallel()
 			var got wireDetail
 			err := Unmarshal([]byte{0x12, 0x01, 0xff}, &got)
 			checkErrorContains(t, err, "text: invalid UTF-8")
 		})
 		t.Run("narrow integer overflow", func(t *testing.T) {
+			t.Parallel()
 			type narrowEvent struct {
 				Code  int8  `protobuf:"1"`
 				Count uint8 `protobuf:"2"`
@@ -230,6 +260,7 @@ func TestUnmarshal(t *testing.T) {
 			checkErrorContains(t, err, "Count: value 256 overflows uint8")
 		})
 		t.Run("excessive nesting", func(t *testing.T) {
+			t.Parallel()
 			var b []byte
 			for range 120 {
 				b = protowire.AppendBytes([]byte{0x0a}, b)
@@ -238,6 +269,7 @@ func TestUnmarshal(t *testing.T) {
 			checkErrorContains(t, Unmarshal(b, &got), "message nesting exceeds 100")
 		})
 		t.Run("wrong wire types leave destination intact", func(t *testing.T) {
+			t.Parallel()
 			type mismatchEvent struct {
 				Code    uint32        `protobuf:"1"`
 				Details []*wireDetail `protobuf:"3"`
@@ -253,6 +285,7 @@ func TestUnmarshal(t *testing.T) {
 			}
 			for _, c := range cases {
 				t.Run(c.name, func(t *testing.T) {
+					t.Parallel()
 					b := append([]byte{0x22, 3, 'n', 'e', 'w'}, c.wire...)
 					want := mismatchEvent{Code: 7, Text: "old"}
 					got := want

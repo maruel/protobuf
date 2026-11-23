@@ -2,6 +2,7 @@ package protobuf
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -26,35 +27,18 @@ func Schema[T any]() (string, error) {
 	return b.String(), nil
 }
 
-// Immutable after construction of the message graph.
-type message struct {
-	typ      reflect.Type
-	fields   []field
-	byNumber map[protowire.Number]int
-}
-
-type field struct {
-	name     string
-	number   protowire.Number
-	index    int
-	kind     protoreflect.Kind
-	message  *message
-	optional bool
-	repeated bool
-}
-
 var messageCache sync.Map // map[reflect.Type]*message
 
 func messageFor(t reflect.Type) (*message, error) {
-	if cached, ok := messageCache.Load(t); ok {
-		return cached.(*message), nil
+	cached, ok := messageCache.Load(t)
+	if !ok {
+		m, err := buildMessage(t, make(map[string]*message))
+		if err != nil {
+			return nil, err
+		}
+		cached, _ = messageCache.LoadOrStore(t, m)
 	}
-	m, err := buildMessage(t, make(map[string]*message))
-	if err != nil {
-		return nil, err
-	}
-	cached, _ := messageCache.LoadOrStore(t, m)
-	return cached.(*message), nil
+	return cached.(*message), nil //nolint:forcetypeassert // The cache only stores *message values.
 }
 
 func buildMessage(t reflect.Type, seen map[string]*message) (*message, error) {
@@ -77,7 +61,7 @@ func buildMessage(t reflect.Type, seen map[string]*message) (*message, error) {
 		if !ok || tag == "-" {
 			continue
 		}
-		f, err := buildField(sf, i, tag, seen)
+		f, err := buildField(&sf, i, tag, seen)
 		if err != nil {
 			return nil, fmt.Errorf("protobuf: %v.%s: %w", t, sf.Name, err)
 		}
@@ -105,9 +89,9 @@ func buildMessage(t reflect.Type, seen map[string]*message) (*message, error) {
 	return m, nil
 }
 
-func buildField(sf reflect.StructField, index int, tag string, seen map[string]*message) (field, error) {
+func buildField(sf *reflect.StructField, index int, tag string, seen map[string]*message) (field, error) {
 	if !sf.IsExported() {
-		return field{}, fmt.Errorf("tagged field must be exported")
+		return field{}, errors.New("tagged field must be exported")
 	}
 	parts := strings.Split(tag, ",")
 	n, err := strconv.ParseUint(parts[0], 10, 29)
@@ -162,7 +146,7 @@ func buildField(sf reflect.StructField, index int, tag string, seen map[string]*
 		case protoreflect.Int64Kind:
 			f.kind = protoreflect.Sint64Kind
 		default:
-			return field{}, fmt.Errorf("zigzag requires a signed integer")
+			return field{}, errors.New("zigzag requires a signed integer")
 		}
 	}
 	return f, nil
@@ -190,34 +174,8 @@ func scalarKind(t reflect.Type) protoreflect.Kind {
 		if t.Elem() == reflect.TypeFor[byte]() {
 			return protoreflect.BytesKind
 		}
-	}
-	return 0
-}
-
-func (m *message) writeSchema(b *strings.Builder, seen map[*message]struct{}) {
-	if _, ok := seen[m]; ok {
-		return
-	}
-	seen[m] = struct{}{}
-	fmt.Fprintf(b, "\nmessage %s {\n", m.typ.Name())
-	for _, f := range m.fields {
-		b.WriteString("  ")
-		switch {
-		case f.repeated:
-			b.WriteString("repeated ")
-		case f.optional:
-			b.WriteString("optional ")
-		}
-		typ := f.kind.String()
-		if f.message != nil {
-			typ = "." + f.message.typ.Name()
-		}
-		fmt.Fprintf(b, "%s %s = %d;\n", typ, f.name, f.number)
-	}
-	b.WriteString("}\n")
-	for _, f := range m.fields {
-		if f.message != nil {
-			f.message.writeSchema(b, seen)
-		}
+		return 0
+	default:
+		return 0
 	}
 }

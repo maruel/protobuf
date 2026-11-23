@@ -1,0 +1,6 @@
+version: v2.15.0
+plugins:
+  - module: github.com/maruel/commentcheck
+    version: v0.1.0
+  - module: github.com/maruel/methodfilecheck
+    version: v0.1.1

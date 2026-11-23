@@ -3,6 +3,7 @@ package protobuf
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -13,22 +14,14 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-const maxMessageDepth = 100
-
-func (m *message) append(dst []byte, v reflect.Value, depth int) ([]byte, error) {
-	if depth > maxMessageDepth {
-		return dst, fmt.Errorf("protobuf: message nesting exceeds %d", maxMessageDepth)
-	}
-	b := dst
-	for i := range m.fields {
-		f := &m.fields[i]
-		var err error
-		b, err = f.append(b, v.Field(f.index), depth)
-		if err != nil {
-			return dst, fmt.Errorf("protobuf: %v.%s: %w", m.typ, f.name, err)
-		}
-	}
-	return b, nil
+type field struct {
+	name     string
+	number   protowire.Number
+	index    int
+	kind     protoreflect.Kind
+	message  *message
+	optional bool
+	repeated bool
 }
 
 func (f *field) append(b []byte, v reflect.Value, depth int) ([]byte, error) {
@@ -80,7 +73,7 @@ func (f *field) appendValue(b []byte, v reflect.Value, depth int) ([]byte, error
 	case protoreflect.StringKind:
 		s := v.String()
 		if !utf8.ValidString(s) {
-			return b, fmt.Errorf("invalid UTF-8")
+			return b, errors.New("invalid UTF-8")
 		}
 		return protowire.AppendString(b, s), nil
 	case protoreflect.BytesKind:
@@ -102,7 +95,7 @@ func (f *field) appendNumeric(b []byte, v reflect.Value) []byte {
 	case protoreflect.BoolKind:
 		return protowire.AppendVarint(b, protowire.EncodeBool(v.Bool()))
 	case protoreflect.Int32Kind, protoreflect.Int64Kind:
-		return protowire.AppendVarint(b, uint64(v.Int()))
+		return protowire.AppendVarint(b, uint64(v.Int())) //nolint:gosec // Protobuf signed varints encode the two's-complement bits.
 	case protoreflect.Uint32Kind, protoreflect.Uint64Kind:
 		return protowire.AppendVarint(b, v.Uint())
 	case protoreflect.Sint32Kind, protoreflect.Sint64Kind:
@@ -131,50 +124,9 @@ func isDefault(v reflect.Value) bool {
 // finishBytes fills the reserved length byte, expanding it for larger values.
 func finishBytes(b []byte, start int) []byte {
 	var buf [binary.MaxVarintLen64]byte
-	prefix := protowire.AppendVarint(buf[:0], uint64(len(b)-start-1))
+	prefix := protowire.AppendVarint(buf[:0], uint64(len(b)-start-1)) //nolint:gosec // The reserved byte at start precedes the payload.
 	b[start] = prefix[0]
 	return slices.Insert(b, start+1, prefix[1:]...)
-}
-
-func (m *message) unmarshal(data []byte, dst reflect.Value) error {
-	v := reflect.New(m.typ).Elem()
-	if err := m.consume(data, v, 0); err != nil {
-		return err
-	}
-	dst.Set(v)
-	return nil
-}
-
-func (m *message) consume(b []byte, v reflect.Value, depth int) error {
-	if depth > maxMessageDepth {
-		return fmt.Errorf("protobuf: message nesting exceeds %d", maxMessageDepth)
-	}
-	for len(b) != 0 {
-		num, typ, n := protowire.ConsumeTag(b)
-		if n < 0 {
-			return fmt.Errorf("protobuf: %v: %w", m.typ, protowire.ParseError(n))
-		}
-		if !num.IsValid() {
-			return fmt.Errorf("protobuf: %v: invalid field number %d", m.typ, num)
-		}
-		b = b[n:]
-		i, ok := m.byNumber[num]
-		if !ok {
-			n := protowire.ConsumeFieldValue(num, typ, b)
-			if n < 0 {
-				return fmt.Errorf("protobuf: %v: field %d: %w", m.typ, num, protowire.ParseError(n))
-			}
-			b = b[n:]
-			continue
-		}
-		f := &m.fields[i]
-		n, err := f.consume(b, typ, v.Field(f.index), depth)
-		if err != nil {
-			return fmt.Errorf("protobuf: %v.%s: %w", m.typ, f.name, err)
-		}
-		b = b[n:]
-	}
-	return nil
 }
 
 func (f *field) consume(b []byte, actual protowire.Type, v reflect.Value, depth int) (int, error) {
@@ -239,12 +191,12 @@ func (f *field) consumeValue(b []byte, v reflect.Value, depth int) (int, error) 
 		switch f.kind {
 		case protoreflect.StringKind:
 			if !utf8.Valid(x) {
-				return 0, fmt.Errorf("invalid UTF-8")
+				return 0, errors.New("invalid UTF-8")
 			}
 			v.SetString(string(x))
 		case protoreflect.BytesKind:
 			v.SetBytes(bytes.Clone(x))
-		case protoreflect.MessageKind:
+		default: // MessageKind is the remaining length-delimited kind.
 			if err := f.message.consume(x, v, depth+1); err != nil {
 				return 0, err
 			}
@@ -260,13 +212,14 @@ func (f *field) consumeValue(b []byte, v reflect.Value, depth int) (int, error) 
 }
 
 func (f *field) setVarint(v reflect.Value, x uint64) error {
+	var i int64
 	switch f.kind {
 	case protoreflect.BoolKind:
 		v.SetBool(protowire.DecodeBool(x))
 		return nil
 	case protoreflect.Uint32Kind, protoreflect.Uint64Kind:
 		if f.kind == protoreflect.Uint32Kind {
-			x = uint64(uint32(x))
+			x = uint64(uint32(x)) //nolint:gosec // Decode uint32 from the low 32 bits of the wire varint.
 		}
 		if v.OverflowUint(x) {
 			return fmt.Errorf("value %d overflows %v", x, v.Type())
@@ -274,13 +227,14 @@ func (f *field) setVarint(v reflect.Value, x uint64) error {
 		v.SetUint(x)
 		return nil
 	case protoreflect.Int32Kind:
-		x = uint64(int32(x))
+		i = int64(int32(x)) //nolint:gosec // Decode int32 from the low 32 bits, with sign extension.
 	case protoreflect.Sint32Kind:
-		x = uint64(int32(protowire.DecodeZigZag(x)))
+		i = int64(int32(protowire.DecodeZigZag(x))) //nolint:gosec // Interpret the decoded low 32 bits as a signed integer.
 	case protoreflect.Sint64Kind:
-		x = uint64(protowire.DecodeZigZag(x))
+		i = protowire.DecodeZigZag(x)
+	default: // Int64Kind uses the full wire width.
+		i = int64(x) //nolint:gosec // Interpret the wire bits as a two's-complement int64.
 	}
-	i := int64(x)
 	if v.OverflowInt(i) {
 		return fmt.Errorf("value %d overflows %v", i, v.Type())
 	}

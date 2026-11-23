@@ -31,7 +31,7 @@ type Writer[T any] struct {
 // A single record can exceed the target if it fits in a 16 MiB page.
 func NewWriter[T any](w io.Writer, pageSize int) (*Writer[T], error) {
 	if w == nil {
-		return nil, fmt.Errorf("protobuf: nil page writer destination")
+		return nil, errors.New("protobuf: nil page writer destination")
 	}
 	if pageSize < 0 || pageSize > maxPageSize {
 		return nil, fmt.Errorf("protobuf: page size %d is outside 0..%d bytes", pageSize, maxPageSize)
@@ -62,7 +62,7 @@ func (w *Writer[T]) Write(v *T) error {
 		return w.err
 	}
 	if v == nil {
-		return fmt.Errorf("protobuf: nil page record")
+		return errors.New("protobuf: nil page record")
 	}
 	b, err := w.msg.append(w.record[:0], reflect.ValueOf(v).Elem(), 0)
 	if err != nil {
@@ -93,8 +93,8 @@ func (w *Writer[T]) Flush() error {
 	}
 	w.frame = w.enc.EncodeAll(w.raw, append(w.frame[:0], make([]byte, pageHeaderSize)...))
 	copy(w.frame, pageMagic)
-	binary.LittleEndian.PutUint32(w.frame[4:8], uint32(len(w.frame)-pageHeaderSize))
-	binary.LittleEndian.PutUint32(w.frame[8:12], uint32(len(w.raw)))
+	binary.LittleEndian.PutUint32(w.frame[4:8], uint32(len(w.frame)-pageHeaderSize)) //nolint:gosec // Zstandard frame overhead keeps a page below the 17 MiB limit.
+	binary.LittleEndian.PutUint32(w.frame[8:12], uint32(len(w.raw)))                 //nolint:gosec // Write bounds the raw page to 16 MiB.
 	n, err := w.dst.Write(w.frame)
 	if err == nil && n != len(w.frame) {
 		err = io.ErrShortWrite
@@ -138,7 +138,7 @@ type Reader struct {
 // NewReader creates a reader for a sequence of Zstandard pages.
 func NewReader(r io.Reader) (*Reader, error) {
 	if r == nil {
-		return nil, fmt.Errorf("protobuf: nil page reader source")
+		return nil, errors.New("protobuf: nil page reader source")
 	}
 	d, err := zstd.NewReader(nil,
 		zstd.WithDecoderConcurrency(1),
@@ -168,7 +168,7 @@ func (r *Reader) Read[T any](dst *T) error {
 		return r.err
 	}
 	if dst == nil {
-		return fmt.Errorf("protobuf: nil page record destination")
+		return errors.New("protobuf: nil page record destination")
 	}
 	m, err := messageFor(reflect.TypeFor[T]())
 	if err != nil {
@@ -200,7 +200,7 @@ func (r *Reader) Events[T any]() iter.Seq2[T, error] {
 		for {
 			var v T
 			err := r.Read(&v)
-			if err == io.EOF || !yield(v, err) || err != nil {
+			if err == io.EOF || !yield(v, err) || err != nil { //nolint:errorlint // A wrapped EOF is an input error and must reach the caller.
 				return
 			}
 		}

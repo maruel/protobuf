@@ -6,7 +6,9 @@ import (
 )
 
 func TestSchema(t *testing.T) {
+	t.Parallel()
 	t.Run("valid", func(t *testing.T) {
+		t.Parallel()
 		type schemaChild struct {
 			Valid bool `protobuf:"1,name=valid"`
 		}
@@ -39,6 +41,7 @@ message schemaChild {
 			t.Fatalf("Schema:\n%s\nwant:\n%s", got, want)
 		}
 		t.Run("empty message", func(t *testing.T) {
+			t.Parallel()
 			type emptyEvent struct{}
 			const want = "syntax = \"proto3\";\n\nmessage emptyEvent {\n}\n"
 			got, err := Schema[emptyEvent]()
@@ -51,6 +54,7 @@ message schemaChild {
 		})
 	})
 	t.Run("error", func(t *testing.T) {
+		t.Parallel()
 		type reserved struct {
 			Value int `protobuf:"19000"`
 		}
@@ -68,6 +72,9 @@ message schemaChild {
 		type unsupported struct {
 			Data map[string]string `protobuf:"1"`
 		}
+		type repeatedSlices struct {
+			Data [][]int `protobuf:"1"`
+		}
 		type badName struct {
 			Value int `protobuf:"1,name=bad-name"`
 		}
@@ -78,12 +85,13 @@ message schemaChild {
 			Value int `protobuf:"1,name=first,name=second"`
 		}
 		type privateField struct {
-			value int `protobuf:"1"`
+			value int `protobuf:"1"` //nolint:unused // Schema checks the rejected private field through reflection.
 		}
 		type timeField struct {
 			At time.Time `protobuf:"1"`
 		}
 		t.Run("distinct types with the same message name", func(t *testing.T) {
+			t.Parallel()
 			type detail struct {
 				Code uint32 `protobuf:"1"`
 			}
@@ -110,6 +118,7 @@ message schemaChild {
 			{name: "duplicate field number", schema: Schema[duplicateNumber], err: "duplicate field number 1"},
 			{name: "conflicting field names", schema: Schema[duplicateName], err: `conflicting JSON names for field "HelloWorld"`},
 			{name: "unsupported type", schema: Schema[unsupported], err: "unsupported field type map[string]string"},
+			{name: "nested non-byte slices", schema: Schema[repeatedSlices], err: "unsupported field type [][]int"},
 			{name: "invalid field name", schema: Schema[badName], err: `invalid protobuf field name "bad-name"`},
 			{name: "zigzag on non-integer", schema: Schema[invalidZigZag], err: "zigzag requires a signed integer"},
 			{name: "duplicate option", schema: Schema[duplicateOption], err: `invalid or duplicate protobuf option "name=second"`},
@@ -119,6 +128,7 @@ message schemaChild {
 		}
 		for _, c := range cases {
 			t.Run(c.name, func(t *testing.T) {
+				t.Parallel()
 				_, err := c.schema()
 				checkErrorContains(t, err, c.err)
 			})

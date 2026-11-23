@@ -19,7 +19,11 @@ func ExampleWriter() {
 	if err != nil {
 		panic(err)
 	}
-	defer os.Remove(f.Name())
+	defer func() {
+		if err := os.Remove(f.Name()); err != nil {
+			panic(err)
+		}
+	}()
 	defer func() {
 		if err := f.Close(); err != nil {
 			panic(err)
