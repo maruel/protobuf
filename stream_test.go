@@ -72,15 +72,103 @@ func TestWriter(t *testing.T) {
 
 func TestNewReader(t *testing.T) {
 	t.Parallel()
+	t.Run("valid", func(t *testing.T) {
+		t.Parallel()
+		first := []byte{0x08, 7}
+		source, err := NewReader(&recordBuffer{records: [][]byte{first}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := NewReader(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := r.ReadRecord()
+		if err != nil || !bytes.Equal(m, first) || &m[0] != &first[0] {
+			t.Fatalf("ReadRecord yielded %x, %v, want the borrowed record %x", m, err, first)
+		}
+		var got streamEvent
+		if err := m.Decode(&got); err != nil || got.Seq != 7 {
+			t.Fatalf("Decode yielded %#v, %v, want sequence 7", got, err)
+		}
+		if _, err := r.ReadRecord(); err != io.EOF { //nolint:errorlint // A clean end of stream returns the exact EOF sentinel.
+			t.Fatalf("ReadRecord returned %v, want io.EOF", err)
+		}
+	})
 	t.Run("error", func(t *testing.T) {
 		t.Parallel()
-		_, err := NewReader(nil)
+		_, err := NewReader[[]byte](nil)
 		checkErrorContains(t, err, "nil record reader")
 	})
 }
 
 func TestReader(t *testing.T) {
 	t.Parallel()
+	t.Run("Records", func(t *testing.T) {
+		t.Parallel()
+		t.Run("valid", func(t *testing.T) {
+			t.Parallel()
+			first := []byte{0x08, 7}
+			r, err := NewReader(&recordBuffer{records: [][]byte{first, {0x08, 9}, nil, {0x80}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			type projection struct {
+				Sequence string `protobuf:"1"`
+			}
+			var incompatible projection
+			checkErrorContains(t, r.Read(&incompatible), "wire type 0, expected 2")
+			var got streamEvent
+			for m, err := range r.Records() {
+				if err != nil || !bytes.Equal(m, first) || &m[0] != &first[0] {
+					t.Fatalf("Records yielded %x, %v, want the borrowed pending record %x", m, err, first)
+				}
+				present, err := m.DecodeField(1, &got)
+				if err != nil || !present {
+					t.Fatalf("DecodeField = %v, %v", present, err)
+				}
+				break
+			}
+			if got.Seq != 7 {
+				t.Fatalf("decoded sequence = %d, want 7", got.Seq)
+			}
+			if err := r.Read(&got); err != nil || got.Seq != 9 {
+				t.Fatalf("Read yielded %#v, %v, want sequence 9", got, err)
+			}
+			if b, err := r.ReadRecord(); err != nil || len(b) != 0 {
+				t.Fatalf("ReadRecord yielded %x, %v, want an empty message", b, err)
+			}
+			n := 0
+			for m, err := range r.Records() {
+				if err != nil || !bytes.Equal(m, []byte{0x80}) {
+					t.Fatalf("Records yielded %x, %v, want the unparsed bytes 80", m, err)
+				}
+				n++
+			}
+			if n != 1 {
+				t.Fatalf("Records yielded %d messages, want one", n)
+			}
+		})
+		t.Run("error", func(t *testing.T) {
+			t.Parallel()
+			wrapped := fmt.Errorf("reading record from storage: %w", io.EOF)
+			r, err := NewReader(&recordBuffer{err: wrapped})
+			if err != nil {
+				t.Fatal(err)
+			}
+			n := 0
+			for m, err := range r.Records() {
+				if !errors.Is(err, wrapped) || m != nil {
+					t.Fatalf("Records yielded %x, %v, want a nil message and %v", m, err, wrapped)
+				}
+				n++
+			}
+			if n != 1 {
+				t.Fatalf("Records yielded %d results, want one", n)
+			}
+		})
+	})
+
 	t.Run("Read", func(t *testing.T) {
 		t.Parallel()
 		t.Run("error", func(t *testing.T) {

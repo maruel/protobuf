@@ -8,11 +8,118 @@ import (
 	"math"
 	"reflect"
 	"slices"
+	"strings"
 	"unicode/utf8"
 
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
+
+const maxMessageDepth = 100
+
+type message struct {
+	// Immutable after construction of the message graph.
+	typ      reflect.Type
+	fields   []field
+	byNumber map[protowire.Number]int
+}
+
+func (m *message) append(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	if depth > maxMessageDepth {
+		return dst, fmt.Errorf("protobuf: message nesting exceeds %d", maxMessageDepth)
+	}
+	b := dst
+	for i := range m.fields {
+		f := &m.fields[i]
+		var err error
+		b, err = f.append(b, v.Field(f.index), depth)
+		if err != nil {
+			return dst, fmt.Errorf("protobuf: %v.%s: %w", m.typ, f.name, err)
+		}
+	}
+	return b, nil
+}
+
+func (m *message) unmarshal(data []byte, dst reflect.Value) error {
+	v := reflect.New(m.typ).Elem()
+	if _, err := m.consume(data, v, 0, nil); err != nil {
+		return err
+	}
+	dst.Set(v)
+	return nil
+}
+
+// consume decodes into a struct. When only is set, v holds a single field
+// and the result reports whether the selected tag appeared.
+func (m *message) consume(b []byte, v reflect.Value, depth int, only *field) (bool, error) {
+	if depth > maxMessageDepth {
+		return false, fmt.Errorf("protobuf: message nesting exceeds %d", maxMessageDepth)
+	}
+	var present bool
+	for len(b) != 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return false, fmt.Errorf("protobuf: %v: %w", m.typ, protowire.ParseError(n))
+		}
+		if !num.IsValid() {
+			return false, fmt.Errorf("protobuf: %v: invalid field number %d", m.typ, num)
+		}
+		b = b[n:]
+		var f *field
+		dst := v
+		if only == nil {
+			if i, ok := m.byNumber[num]; ok {
+				f = &m.fields[i]
+				dst = v.Field(f.index)
+			}
+		} else if num == only.number {
+			f = only
+		}
+		if f == nil {
+			n := protowire.ConsumeFieldValue(num, typ, b)
+			if n < 0 {
+				return false, fmt.Errorf("protobuf: %v: field %d: %w", m.typ, num, protowire.ParseError(n))
+			}
+			b = b[n:]
+			continue
+		}
+		n, err := f.consume(b, typ, dst, depth)
+		if err != nil {
+			return false, fmt.Errorf("protobuf: %v.%s: %w", m.typ, f.name, err)
+		}
+		present = true
+		b = b[n:]
+	}
+	return present, nil
+}
+
+func (m *message) writeSchema(b *strings.Builder, seen map[*message]struct{}) {
+	if _, ok := seen[m]; ok {
+		return
+	}
+	seen[m] = struct{}{}
+	fmt.Fprintf(b, "\nmessage %s {\n", m.typ.Name())
+	for _, f := range m.fields {
+		b.WriteString("  ")
+		switch {
+		case f.repeated:
+			b.WriteString("repeated ")
+		case f.optional:
+			b.WriteString("optional ")
+		}
+		typ := f.kind.String()
+		if f.message != nil {
+			typ = "." + f.message.typ.Name()
+		}
+		fmt.Fprintf(b, "%s %s = %d;\n", typ, f.name, f.number)
+	}
+	b.WriteString("}\n")
+	for _, f := range m.fields {
+		if f.message != nil {
+			f.message.writeSchema(b, seen)
+		}
+	}
+}
 
 type field struct {
 	name     string
@@ -197,7 +304,7 @@ func (f *field) consumeValue(b []byte, v reflect.Value, depth int) (int, error) 
 		case protoreflect.BytesKind:
 			v.SetBytes(bytes.Clone(x))
 		default: // MessageKind is the remaining length-delimited kind.
-			if err := f.message.consume(x, v, depth+1); err != nil {
+			if _, err := f.message.consume(x, v, depth+1, nil); err != nil {
 				return 0, err
 			}
 		}

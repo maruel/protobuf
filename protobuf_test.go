@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/encoding/protowire"
 )
@@ -299,6 +300,254 @@ func TestUnmarshal(t *testing.T) {
 	})
 }
 
+func TestSchema(t *testing.T) {
+	t.Parallel()
+	t.Run("valid", func(t *testing.T) {
+		t.Parallel()
+		type schemaChild struct {
+			Valid bool `protobuf:"1,name=valid"`
+		}
+		type schemaRoot struct {
+			Children []schemaChild `protobuf:"12,name=children"`
+			Parent   *schemaRoot   `protobuf:"11,name=parent"`
+			Delta    *int32        `protobuf:"5,name=delta,zigzag"`
+			IDs      []uint64      `protobuf:"1"`
+			Cache    string        `protobuf:"-"`
+			Local    string
+		}
+		const want = `syntax = "proto3";
+
+message schemaRoot {
+  repeated uint64 IDs = 1;
+  optional sint32 delta = 5;
+  .schemaRoot parent = 11;
+  repeated .schemaChild children = 12;
+}
+
+message schemaChild {
+  bool valid = 1;
+}
+`
+		got, err := Schema[schemaRoot]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("Schema:\n%s\nwant:\n%s", got, want)
+		}
+		t.Run("empty message", func(t *testing.T) {
+			t.Parallel()
+			type emptyEvent struct{}
+			const want = "syntax = \"proto3\";\n\nmessage emptyEvent {\n}\n"
+			got, err := Schema[emptyEvent]()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				t.Fatalf("Schema:\n%s\nwant:\n%s", got, want)
+			}
+		})
+	})
+	t.Run("error", func(t *testing.T) {
+		t.Parallel()
+		type reserved struct {
+			Value int `protobuf:"19000"`
+		}
+		type tooLarge struct {
+			Value int `protobuf:"536870912"`
+		}
+		type duplicateNumber struct {
+			A int `protobuf:"1"`
+			B int `protobuf:"1"`
+		}
+		type duplicateName struct {
+			A int `protobuf:"1,name=hello_world"`
+			B int `protobuf:"2,name=HelloWorld"`
+		}
+		type unsupported struct {
+			Data map[string]string `protobuf:"1"`
+		}
+		type repeatedSlices struct {
+			Data [][]int `protobuf:"1"`
+		}
+		type badName struct {
+			Value int `protobuf:"1,name=bad-name"`
+		}
+		type invalidZigZag struct {
+			Text string `protobuf:"1,zigzag"`
+		}
+		type duplicateOption struct {
+			Value int `protobuf:"1,name=first,name=second"`
+		}
+		type privateField struct {
+			value int `protobuf:"1"` //nolint:unused // Schema checks the rejected private field through reflection.
+		}
+		type timeField struct {
+			At time.Time `protobuf:"1"`
+		}
+		t.Run("distinct types with the same message name", func(t *testing.T) {
+			t.Parallel()
+			type detail struct {
+				Code uint32 `protobuf:"1"`
+			}
+			type firstDetail = detail
+			{
+				type detail struct {
+					Text string `protobuf:"1"`
+				}
+				type event struct {
+					First  firstDetail `protobuf:"1"`
+					Second detail      `protobuf:"2"`
+				}
+				_, err := Schema[event]()
+				checkErrorContains(t, err, `share message name "detail"`)
+			}
+		})
+		cases := []struct {
+			name   string
+			schema func() (string, error)
+			err    string
+		}{
+			{name: "reserved field number", schema: Schema[reserved], err: `invalid protobuf field number "19000"`},
+			{name: "out of range field number", schema: Schema[tooLarge], err: `invalid protobuf field number "536870912"`},
+			{name: "duplicate field number", schema: Schema[duplicateNumber], err: "duplicate field number 1"},
+			{name: "conflicting field names", schema: Schema[duplicateName], err: `conflicting JSON names for field "HelloWorld"`},
+			{name: "unsupported type", schema: Schema[unsupported], err: "unsupported field type map[string]string"},
+			{name: "nested non-byte slices", schema: Schema[repeatedSlices], err: "unsupported field type [][]int"},
+			{name: "invalid field name", schema: Schema[badName], err: `invalid protobuf field name "bad-name"`},
+			{name: "zigzag on non-integer", schema: Schema[invalidZigZag], err: "zigzag requires a signed integer"},
+			{name: "duplicate option", schema: Schema[duplicateOption], err: `invalid or duplicate protobuf option "name=second"`},
+			{name: "tagged private field", schema: Schema[privateField], err: "tagged field must be exported"},
+			{name: "untagged nested struct", schema: Schema[timeField], err: "time.Time has Go fields but no protobuf fields"},
+			{name: "unnamed struct", schema: Schema[struct{}], err: "is not a named struct with a valid protobuf identifier"},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				t.Parallel()
+				_, err := c.schema()
+				checkErrorContains(t, err, c.err)
+			})
+		}
+	})
+}
+
+func TestRawMessage(t *testing.T) {
+	t.Parallel()
+	t.Run("Decode", func(t *testing.T) {
+		t.Parallel()
+		t.Run("error", func(t *testing.T) {
+			t.Parallel()
+			m := RawMessage{0x08, 5, 0x12, 2, 'x'}
+			want := wireDetail{Code: 99, Text: "old"}
+			got := want
+			if err := m.Decode(&got); !errors.Is(err, io.ErrUnexpectedEOF) || got != want {
+				t.Fatalf("Decode = %#v, %v, want the previous value and io.ErrUnexpectedEOF", got, err)
+			}
+		})
+	})
+	t.Run("DecodeField", func(t *testing.T) {
+		t.Parallel()
+		t.Run("valid", func(t *testing.T) {
+			t.Parallel()
+			t.Run("last zigzag occurrence skips unrelated contents", func(t *testing.T) {
+				t.Parallel()
+				// The unselected string field contains invalid UTF-8.
+				m := RawMessage{0x10, 0x09, 0x3a, 1, 0xff, 0x10, 0x21}
+				got := wireEvent{Counter: 7, Text: "keep"}
+				present, err := m.DecodeField(2, &got)
+				if err != nil || !present || got.Delta != -17 || got.Counter != 7 || got.Text != "keep" {
+					t.Fatalf("DecodeField = %#v, %v, %v", got, present, err)
+				}
+			})
+			t.Run("absent and explicit zero", func(t *testing.T) {
+				t.Parallel()
+				got := wireEvent{Counter: 7}
+				present, err := (RawMessage{0x18, 1}).DecodeField(1, &got)
+				if err != nil || present || got.Counter != 7 || got.Active {
+					t.Fatalf("absent field yielded %#v, %v, %v", got, present, err)
+				}
+				present, err = (RawMessage{0x08, 0}).DecodeField(1, &got)
+				if err != nil || !present || got.Counter != 0 {
+					t.Fatalf("explicit zero yielded %#v, %v, %v", got, present, err)
+				}
+			})
+			t.Run("mixed packed and unpacked values", func(t *testing.T) {
+				t.Parallel()
+				m := RawMessage{0x30, 1, 0x32, 3, 0, 0x96, 1, 0x30, 2}
+				got := wireEvent{Counts: []uint64{99}}
+				present, err := m.DecodeField(6, &got)
+				if err != nil || !present || !reflect.DeepEqual(got.Counts, []uint64{1, 0, 150, 2}) {
+					t.Fatalf("DecodeField = %v, %v, %v", got.Counts, present, err)
+				}
+			})
+			t.Run("merge occurrences of a submessage", func(t *testing.T) {
+				t.Parallel()
+				m := RawMessage{0x42, 2, 0x08, 5, 0x42, 3, 0x12, 1, 'x'}
+				old := wireDetail{Code: 99, Text: "old"}
+				got := wireEvent{Detail: &old}
+				present, err := m.DecodeField(8, &got)
+				if err != nil || !present || got.Detail == nil || *got.Detail != (wireDetail{Code: 5, Text: "x"}) {
+					t.Fatalf("DecodeField = %#v, %v, %v", got.Detail, present, err)
+				}
+				if old != (wireDetail{Code: 99, Text: "old"}) {
+					t.Fatalf("previous submessage changed to %#v", old)
+				}
+			})
+			t.Run("decoded bytes own their storage", func(t *testing.T) {
+				t.Parallel()
+				m := RawMessage{0x72, 3, 1, 2, 3}
+				var got wireEvent
+				present, err := m.DecodeField(14, &got)
+				clear(m)
+				if err != nil || !present || !bytes.Equal(got.Data, []byte{1, 2, 3}) {
+					t.Fatalf("DecodeField = %x, %v, %v", got.Data, present, err)
+				}
+			})
+		})
+		t.Run("error", func(t *testing.T) {
+			t.Parallel()
+			t.Run("invalid destination", func(t *testing.T) {
+				t.Parallel()
+				var m RawMessage
+				_, err := m.DecodeField(1, (*wireEvent)(nil))
+				checkErrorContains(t, err, "expected a non-nil pointer")
+				var unsupported int
+				_, err = m.DecodeField(1, &unsupported)
+				checkErrorContains(t, err, "not a named struct")
+			})
+			t.Run("invalid or undeclared number", func(t *testing.T) {
+				t.Parallel()
+				var m RawMessage
+				var got wireEvent
+				_, err := m.DecodeField(0, &got)
+				checkErrorContains(t, err, "invalid field number 0")
+				_, err = m.DecodeField(1<<29, &got)
+				checkErrorContains(t, err, "invalid field number 536870912")
+				_, err = m.DecodeField(99, &got)
+				checkErrorContains(t, err, "has no field 99")
+			})
+			t.Run("malformed skipped field rolls back selection", func(t *testing.T) {
+				t.Parallel()
+				m := RawMessage{0x08, 1, 0x72, 2, 1}
+				got := wireEvent{Counter: 7}
+				present, err := m.DecodeField(1, &got)
+				if !errors.Is(err, io.ErrUnexpectedEOF) || present || got.Counter != 7 {
+					t.Fatalf("DecodeField = %d, %v, %v", got.Counter, present, err)
+				}
+			})
+			t.Run("malformed selected field rolls back selection", func(t *testing.T) {
+				t.Parallel()
+				m := RawMessage{0x30, 1, 0x32, 2, 0x02, 0x80}
+				got := wireEvent{Counts: []uint64{99}}
+				present, err := m.DecodeField(6, &got)
+				if !errors.Is(err, io.ErrUnexpectedEOF) || present || !reflect.DeepEqual(got.Counts, []uint64{99}) {
+					t.Fatalf("DecodeField = %v, %v, %v", got.Counts, present, err)
+				}
+			})
+		})
+	})
+}
+
 func BenchmarkMarshal(b *testing.B) {
 	v := benchmarkWireEvent()
 	data, err := Marshal(&v)
@@ -344,6 +593,26 @@ func BenchmarkUnmarshal(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func BenchmarkRawMessage(b *testing.B) {
+	b.Run("DecodeField", func(b *testing.B) {
+		v := benchmarkWireEvent()
+		data, err := Marshal(&v)
+		if err != nil {
+			b.Fatal(err)
+		}
+		m := RawMessage(data)
+		b.SetBytes(int64(len(data)))
+		b.ReportAllocs()
+		var dst wireEvent
+		for b.Loop() {
+			present, err := m.DecodeField(1, &dst)
+			if err != nil || !present {
+				b.Fatalf("DecodeField = %v, %v", present, err)
+			}
+		}
+	})
 }
 
 func benchmarkWireEvent() wireEvent {
