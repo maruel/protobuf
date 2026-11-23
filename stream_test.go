@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -530,6 +531,57 @@ func TestReader(t *testing.T) {
 			})
 		})
 	})
+}
+
+func TestSchemaCache(t *testing.T) {
+	t.Parallel()
+	type (
+		a struct{}
+		b struct{}
+		c struct{}
+		d struct{}
+		e struct{}
+		f struct{}
+		g struct{}
+		h struct{}
+		i struct{}
+	)
+	var cache schemaCache
+	types := [...]struct {
+		typ    reflect.Type
+		lookup func() (*message, error)
+	}{
+		{reflect.TypeFor[a](), cache.lookupFor[a]},
+		{reflect.TypeFor[b](), cache.lookupFor[b]},
+		{reflect.TypeFor[c](), cache.lookupFor[c]},
+		{reflect.TypeFor[d](), cache.lookupFor[d]},
+		{reflect.TypeFor[e](), cache.lookupFor[e]},
+		{reflect.TypeFor[f](), cache.lookupFor[f]},
+		{reflect.TypeFor[g](), cache.lookupFor[g]},
+		{reflect.TypeFor[h](), cache.lookupFor[h]},
+		{reflect.TypeFor[i](), cache.lookupFor[i]},
+	}
+	for n, tc := range types {
+		m, err := tc.lookup()
+		if err != nil || m == nil || m.typ != tc.typ {
+			t.Fatalf("lookupFor[%v]() = %v, %v", tc.typ, m, err)
+		}
+		if cache.entries[0] != m {
+			t.Fatalf("lookupFor[%v]() did not fill the primary slot", tc.typ)
+		}
+		if n < 7 {
+			continue
+		}
+		before := cache
+		for _, hit := range types[n-7 : n] {
+			if m, err := hit.lookup(); err != nil || m == nil || m.typ != hit.typ {
+				t.Fatalf("lookupFor[%v]() = %v, %v", hit.typ, m, err)
+			}
+		}
+		if cache != before {
+			t.Fatalf("secondary hits changed the cache after %d insertions", n+1)
+		}
+	}
 }
 
 func BenchmarkWriter(b *testing.B) {

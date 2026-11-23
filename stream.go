@@ -14,11 +14,11 @@ import (
 // Writer writes a stream of length-delimited protobuf records. Use NewWriter
 // to construct it and call its methods serially.
 type Writer struct {
-	dst    io.Writer
-	schema *message
-	buf    []byte
-	prefix [binary.MaxVarintLen32]byte
-	err    error
+	dst     io.Writer
+	schemas schemaCache
+	buf     []byte
+	prefix  [binary.MaxVarintLen32]byte
+	err     error
 }
 
 // NewWriter creates a writer over w. The caller owns the destination,
@@ -40,14 +40,9 @@ func (w *Writer) Write[T any](v *T) error {
 	if v == nil {
 		return errors.New("protobuf: nil record")
 	}
-	m := w.schema
-	if t := reflect.TypeFor[T](); m == nil || m.typ != t {
-		var err error
-		m, err = messageFor(t)
-		if err != nil {
-			return err
-		}
-		w.schema = m
+	m, err := w.schemas.lookupFor[T]()
+	if err != nil {
+		return err
 	}
 	b, err := m.append(w.buf[:0], reflect.ValueOf(v).Elem(), 0)
 	if err != nil {
@@ -91,11 +86,11 @@ func (w *Writer) WriteRawFrom(src io.Reader, size int64) error {
 // wire-compatible named struct types. Use NewReader to construct it and call
 // its methods serially.
 type Reader struct {
-	src    *bufio.Reader
-	schema *message
-	buf    []byte
-	record RawMessage
-	err    error
+	src     *bufio.Reader
+	schemas schemaCache
+	buf     []byte
+	record  RawMessage
+	err     error
 }
 
 // NewReader creates a reader over r. The reader may buffer ahead. The caller
@@ -115,14 +110,9 @@ func (r *Reader) Read[T any](dst *T) error {
 	if dst == nil {
 		return errors.New("protobuf: nil record destination")
 	}
-	m := r.schema
-	if t := reflect.TypeFor[T](); m == nil || m.typ != t {
-		var err error
-		m, err = messageFor(t)
-		if err != nil {
-			return err
-		}
-		r.schema = m
+	m, err := r.schemas.lookupFor[T]()
+	if err != nil {
+		return err
 	}
 	b, err := r.ReadRaw()
 	if err != nil {
@@ -237,6 +227,39 @@ func (r *Reader) readChunk(n int) (RawMessage, error) {
 	}
 	_, _ = r.src.Discard(n) // Peek ensured that n bytes are already buffered.
 	return b, nil
+}
+
+type schemaCache struct {
+	entries [8]*message
+	next    int
+}
+
+// lookupFor resolves the schema for T. Hits leave the entries in place.
+// A new schema takes slot zero and moves its predecessor into the ring of
+// secondary slots, which fill in order and evict the oldest schema.
+func (c *schemaCache) lookupFor[T any]() (*message, error) {
+	t := reflect.TypeFor[T]()
+	if m := c.entries[0]; m != nil && m.typ == t {
+		return m, nil
+	}
+	for _, m := range c.entries[1:] {
+		if m == nil {
+			break
+		}
+		if m.typ == t {
+			return m, nil
+		}
+	}
+	m, err := messageFor(t)
+	if err != nil {
+		return nil, err
+	}
+	if p := c.entries[0]; p != nil {
+		c.entries[c.next+1] = p
+		c.next = (c.next + 1) % (len(c.entries) - 1)
+	}
+	c.entries[0] = m
+	return m, nil
 }
 
 func writeFull(w io.Writer, b []byte) (int, error) {
