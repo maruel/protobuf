@@ -12,22 +12,24 @@ import (
 	"slices"
 )
 
-// Writer writes a stream of length-delimited protobuf records. Use NewWriter
-// to construct it and call its methods serially.
+// Writer writes a stream of length-delimited protobuf records. Call its methods
+// serially.
 type Writer struct {
-	dst     io.Writer
+	// Dst receives records. Set it before use and change it only between calls.
+	// The caller owns any flushing or closing it requires.
+	Dst io.Writer
+
 	schemas schemaCache
 	buf     []byte
 	prefix  [binary.MaxVarintLen32]byte
 }
 
-// NewWriter creates a writer over w. The caller owns the destination,
-// including any flushing or closing it requires.
+// NewWriter creates a writer over w.
 func NewWriter(w io.Writer) (*Writer, error) {
 	if w == nil {
 		return nil, errors.New("protobuf: nil record writer")
 	}
-	return &Writer{dst: w}, nil
+	return &Writer{Dst: w}, nil
 }
 
 // Write encodes a non-nil pointer to a named struct as one record. It
@@ -51,10 +53,10 @@ func (w *Writer) Write[T any](v *T) error {
 	}
 	w.buf = b
 	p := binary.AppendUvarint(w.prefix[:0], uint64(len(b)))
-	if err := writeFull(w.dst, p); err != nil || len(b) == 0 {
+	if err := writeFull(w.Dst, p); err != nil || len(b) == 0 {
 		return err
 	}
-	return writeFull(w.dst, b)
+	return writeFull(w.Dst, b)
 }
 
 // WriteRawFrom copies size bytes of an already encoded message from src
@@ -69,10 +71,10 @@ func (w *Writer) WriteRawFrom(src io.Reader, size int64) error {
 		return fmt.Errorf("protobuf: record size %d is outside 0..%d bytes", size, maxRecordSize)
 	}
 	p := binary.AppendUvarint(w.prefix[:0], uint64(size))
-	if err := writeFull(w.dst, p); err != nil || size == 0 {
+	if err := writeFull(w.Dst, p); err != nil || size == 0 {
 		return err
 	}
-	_, err := copyRecord(w.dst, src, size)
+	_, err := copyRecord(w.Dst, src, size)
 	return err
 }
 
@@ -95,15 +97,17 @@ func (e *DecodeError) Unwrap() error {
 }
 
 // Reader reads length-delimited protobuf records and can decode them into
-// wire-compatible named struct types. Use NewReader to construct it and call
-// its methods serially.
+// wire-compatible named struct types. Call its methods serially.
 //
 // Errors apply to the current call. After a framing or I/O error, continue
-// with this Reader only if you know the call stopped at a record boundary.
-// To resume after repositioning the source, create a new Reader at a record
-// boundary.
+// reading from the same position only if you know the call stopped at a record
+// boundary. To resume after repositioning the source at a record boundary,
+// reset or replace Src to discard any buffered bytes.
 type Reader struct {
-	src     *bufio.Reader
+	// Src is the buffered source of records. Set it to an initialized reader
+	// before use. Reset or replace it only between calls.
+	Src *bufio.Reader
+
 	schemas schemaCache
 	buf     []byte
 }
@@ -114,7 +118,7 @@ func NewReader(r io.Reader) (*Reader, error) {
 	if r == nil {
 		return nil, errors.New("protobuf: nil record reader")
 	}
-	return &Reader{src: bufio.NewReader(r)}, nil
+	return &Reader{Src: bufio.NewReader(r)}, nil
 }
 
 // Read replaces dst with the next decoded record and passes through errors
@@ -146,9 +150,9 @@ func (r *Reader) Read[T any](dst *T) error {
 	return nil
 }
 
-// ReadRaw returns the next encoded record. Its read-only bytes are valid
-// until the next read or until the source closes. It buffers the whole record.
-// A clean end of stream returns io.EOF.
+// ReadRaw returns the next encoded record and buffers it in full. Its read-only
+// bytes are valid until the next read, until Src is reset or replaced, or until
+// the source closes. A clean end of stream returns io.EOF.
 func (r *Reader) ReadRaw() (RawMessage, error) {
 	n, err := r.readSize()
 	if err != nil {
@@ -159,7 +163,7 @@ func (r *Reader) ReadRaw() (RawMessage, error) {
 	}
 	b := r.buf[:0]
 	for len(b) < n {
-		p, err := r.readChunk(min(n-len(b), r.src.Size()))
+		p, err := r.readChunk(min(n-len(b), r.Src.Size()))
 		if err != nil {
 			return nil, err
 		}
@@ -180,7 +184,7 @@ func (r *Reader) ReadRawTo(dst io.Writer) (int64, error) {
 	if err != nil || n == 0 {
 		return 0, err
 	}
-	c, err := copyRecord(dst, r.src, int64(n))
+	c, err := copyRecord(dst, r.Src, int64(n))
 	if err != nil {
 		return c, fmt.Errorf("protobuf: copy record: %w", err)
 	}
@@ -204,11 +208,11 @@ func (r *Reader) RawMessages() iter.Seq2[RawMessage, error] {
 const maxRecordSize = math.MaxInt32
 
 func (r *Reader) fitsInputBuffer(n int) bool {
-	return n <= r.src.Size()
+	return n <= r.Src.Size()
 }
 
 func (r *Reader) readSize() (int, error) {
-	n, err := binary.ReadUvarint(r.src)
+	n, err := binary.ReadUvarint(r.Src)
 	switch {
 	case err == io.EOF: //nolint:errorlint // Only the exact EOF marks a clean end of stream.
 		return 0, io.EOF
@@ -222,14 +226,14 @@ func (r *Reader) readSize() (int, error) {
 }
 
 func (r *Reader) readChunk(n int) (RawMessage, error) {
-	b, err := r.src.Peek(n)
+	b, err := r.Src.Peek(n)
 	if err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
 		return nil, fmt.Errorf("protobuf: read record body: %w", err)
 	}
-	_, _ = r.src.Discard(n) // Peek ensured that n bytes are already buffered.
+	_, _ = r.Src.Discard(n) // Peek ensured that n bytes are already buffered.
 	return b, nil
 }
 

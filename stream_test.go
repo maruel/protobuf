@@ -1,6 +1,7 @@
 package protobuf
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
@@ -142,17 +143,7 @@ func TestWriter(t *testing.T) {
 			})
 			t.Run("short prefix write", func(t *testing.T) {
 				t.Parallel()
-				var dst bytes.Buffer
-				fail := true
-				w, err := NewWriter(writerFunc(func(b []byte) (int, error) {
-					if fail {
-						return 0, nil
-					}
-					return dst.Write(b)
-				}))
-				if err != nil {
-					t.Fatal(err)
-				}
+				w := Writer{Dst: writerFunc(func([]byte) (int, error) { return 0, nil })}
 				if err := w.Write(&streamEvent{Seq: 7}); !errors.Is(err, io.ErrShortWrite) {
 					t.Fatalf("Write = %v, want io.ErrShortWrite", err)
 				}
@@ -160,7 +151,8 @@ func TestWriter(t *testing.T) {
 				if err := w.WriteRawFrom(src, 2); !errors.Is(err, io.ErrShortWrite) || src.Len() != 2 {
 					t.Fatalf("WriteRawFrom with a short prefix write = %v with %d unread", err, src.Len())
 				}
-				fail = false
+				var dst bytes.Buffer
+				w.Dst = &dst
 				if err := w.WriteRawFrom(src, 2); err != nil || src.Len() != 0 || dst.String() != "\x02\x08\x07" {
 					t.Fatalf("WriteRawFrom retry = %x, %v with %d unread", dst.Bytes(), err, src.Len())
 				}
@@ -216,6 +208,17 @@ func TestReader(t *testing.T) {
 				src.Write([]byte{2, 0x08, 7})
 				if got, err := r.ReadRaw(); err != nil || !bytes.Equal(got, []byte{0x08, 7}) {
 					t.Fatalf("ReadRaw after EOF = %x, %v, want 0807, nil", got, err)
+				}
+			})
+			t.Run("reset source after a framing error", func(t *testing.T) {
+				t.Parallel()
+				r := Reader{Src: bufio.NewReader(strings.NewReader("\x03\x08\x07"))}
+				if _, err := r.ReadRaw(); !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Fatalf("ReadRaw = %v, want io.ErrUnexpectedEOF", err)
+				}
+				r.Src.Reset(framedRecords([]byte{0x08, 9}))
+				if got, err := r.ReadRaw(); err != nil || !bytes.Equal(got, []byte{0x08, 9}) {
+					t.Fatalf("ReadRaw after resetting Src = %x, %v, want 0809, nil", got, err)
 				}
 			})
 			t.Run("large buffered message", func(t *testing.T) {
