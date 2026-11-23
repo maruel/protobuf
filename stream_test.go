@@ -2,11 +2,13 @@ package protobuf
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"reflect"
-	"slices"
+	"strings"
 	"testing"
 
 	"github.com/maruel/protobuf/page"
@@ -22,10 +24,8 @@ func TestNewWriter(t *testing.T) {
 	t.Parallel()
 	t.Run("error", func(t *testing.T) {
 		t.Parallel()
-		_, err := NewWriter[streamEvent](nil)
+		_, err := NewWriter(nil)
 		checkErrorContains(t, err, "nil record writer")
-		_, err = NewWriter[*streamEvent](&recordBuffer{})
-		checkErrorContains(t, err, "not a named struct")
 	})
 }
 
@@ -35,37 +35,123 @@ func TestWriter(t *testing.T) {
 		t.Parallel()
 		t.Run("valid", func(t *testing.T) {
 			t.Parallel()
-			var dst recordBuffer
-			w, err := NewWriter[streamEvent](&dst)
+			var dst bytes.Buffer
+			w, err := NewWriter(&dst)
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, e := range []streamEvent{{Seq: 7, Text: "ok"}, {Seq: 9}, {}} {
-				if err := w.Write(&e); err != nil {
-					t.Fatal(err)
-				}
+			if err := w.Write(&streamEvent{Seq: 7, Text: "ok"}); err != nil {
+				t.Fatal(err)
 			}
-			want := [][]byte{{0x08, 7, 0x12, 2, 'o', 'k'}, {0x08, 9}, nil}
-			if !slices.EqualFunc(dst.records, want, bytes.Equal) {
-				t.Fatalf("written records = %x, want %x", dst.records, want)
+			type sequence struct {
+				Number uint64 `protobuf:"1"`
+			}
+			if err := w.Write(&sequence{Number: 9}); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Write(&streamEvent{}); err != nil {
+				t.Fatal(err)
+			}
+			want := []byte{6, 0x08, 7, 0x12, 2, 'o', 'k', 2, 0x08, 9, 0}
+			if !bytes.Equal(dst.Bytes(), want) {
+				t.Fatalf("written stream = %x, want %x", dst.Bytes(), want)
 			}
 		})
 		t.Run("error", func(t *testing.T) {
 			t.Parallel()
-			var dst recordBuffer
-			w, err := NewWriter[streamEvent](&dst)
+			var dst bytes.Buffer
+			w, err := NewWriter(&dst)
 			if err != nil {
 				t.Fatal(err)
 			}
-			checkErrorContains(t, w.Write(nil), "nil record")
+			if err := w.Write(&streamEvent{Seq: 7}); err != nil {
+				t.Fatal(err)
+			}
+			checkErrorContains(t, w.Write[streamEvent](nil), "nil record")
+			var unsupported string
+			checkErrorContains(t, w.Write(&unsupported), "not a named struct")
 			checkErrorContains(t, w.Write(&streamEvent{Seq: 7, Text: "\xff"}), "invalid UTF-8")
-			dst.err = io.ErrShortWrite
-			if err := w.Write(&streamEvent{Seq: 9}); !errors.Is(err, io.ErrShortWrite) {
-				t.Fatalf("Write returned %v, want io.ErrShortWrite", err)
+			if want := []byte{2, 0x08, 7}; !bytes.Equal(dst.Bytes(), want) {
+				t.Fatalf("stream after rejected writes = %x, want %x", dst.Bytes(), want)
 			}
-			if len(dst.records) != 0 {
-				t.Fatalf("rejected writes stored %x", dst.records)
+			if err := w.Write(&streamEvent{Seq: 9}); err != nil || !bytes.Equal(dst.Bytes(), []byte{2, 0x08, 7, 2, 0x08, 9}) {
+				t.Fatalf("Write after rejected messages yielded %x, %v", dst.Bytes(), err)
 			}
+		})
+	})
+	t.Run("WriteRawFrom", func(t *testing.T) {
+		t.Parallel()
+		t.Run("valid", func(t *testing.T) {
+			t.Parallel()
+			var dst bytes.Buffer
+			w, err := NewWriter(&dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			src := bytes.NewReader([]byte{0x08, 7, 0xff})
+			if err := w.WriteRawFrom(src, 2); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.WriteRawFrom(src, 0); err != nil {
+				t.Fatal(err)
+			}
+			p, err := src.ReadByte()
+			if p != 0xff || err != nil || !bytes.Equal(dst.Bytes(), []byte{2, 0x08, 7, 0}) {
+				t.Fatalf("stream = %x, trailing byte = %x, error = %v", dst.Bytes(), p, err)
+			}
+		})
+		t.Run("error", func(t *testing.T) {
+			t.Parallel()
+			t.Run("invalid arguments", func(t *testing.T) {
+				t.Parallel()
+				var dst bytes.Buffer
+				w, err := NewWriter(&dst)
+				if err != nil {
+					t.Fatal(err)
+				}
+				src := strings.NewReader("\x08\x07")
+				checkErrorContains(t, w.WriteRawFrom(nil, 2), "nil record source")
+				checkErrorContains(t, w.WriteRawFrom(src, -1), "record size -1 is outside")
+				checkErrorContains(t, w.WriteRawFrom(src, 1<<31), "record size 2147483648 is outside")
+				if dst.Len() != 0 || src.Len() != 2 {
+					t.Fatalf("rejected writes changed destination or source: %x, %d unread", dst.Bytes(), src.Len())
+				}
+				if err := w.WriteRawFrom(src, 2); err != nil {
+					t.Fatal(err)
+				}
+			})
+			t.Run("maximum size with truncated body", func(t *testing.T) {
+				t.Parallel()
+				var dst bytes.Buffer
+				w, err := NewWriter(&dst)
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = w.WriteRawFrom(strings.NewReader("\x08"), 1<<31-1)
+				if !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Fatalf("WriteRawFrom = %v, want io.ErrUnexpectedEOF", err)
+				}
+				if err := w.Write(&streamEvent{Seq: 7}); !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Fatalf("Write after failed transfer = %v, want io.ErrUnexpectedEOF", err)
+				}
+				if want := []byte{0xff, 0xff, 0xff, 0xff, 0x07, 0x08}; !bytes.Equal(dst.Bytes(), want) {
+					t.Fatalf("partial stream = %x, want %x", dst.Bytes(), want)
+				}
+			})
+			t.Run("short prefix write", func(t *testing.T) {
+				t.Parallel()
+				w, err := NewWriter(writerFunc(func([]byte) (int, error) { return 0, nil }))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := w.Write(&streamEvent{Seq: 7}); !errors.Is(err, io.ErrShortWrite) {
+					t.Fatalf("Write = %v, want io.ErrShortWrite", err)
+				}
+				src := strings.NewReader("\x08\x07")
+				if err := w.WriteRawFrom(src, 2); !errors.Is(err, io.ErrShortWrite) || src.Len() != 2 {
+					t.Fatalf("WriteRawFrom after failed write = %v with %d unread", err, src.Len())
+				}
+			})
 		})
 	})
 }
@@ -75,41 +161,260 @@ func TestNewReader(t *testing.T) {
 	t.Run("valid", func(t *testing.T) {
 		t.Parallel()
 		first := []byte{0x08, 7}
-		source, err := NewReader(&recordBuffer{records: [][]byte{first}})
+		r, err := NewReader(framedRecords(first))
 		if err != nil {
 			t.Fatal(err)
 		}
-		r, err := NewReader(source)
-		if err != nil {
-			t.Fatal(err)
-		}
-		m, err := r.ReadRecord()
-		if err != nil || !bytes.Equal(m, first) || &m[0] != &first[0] {
-			t.Fatalf("ReadRecord yielded %x, %v, want the borrowed record %x", m, err, first)
+		m, err := r.ReadRaw()
+		if err != nil || !bytes.Equal(m, first) {
+			t.Fatalf("ReadRaw yielded %x, %v, want the record %x", m, err, first)
 		}
 		var got streamEvent
 		if err := m.Decode(&got); err != nil || got.Seq != 7 {
 			t.Fatalf("Decode yielded %#v, %v, want sequence 7", got, err)
 		}
-		if _, err := r.ReadRecord(); err != io.EOF { //nolint:errorlint // A clean end of stream returns the exact EOF sentinel.
-			t.Fatalf("ReadRecord returned %v, want io.EOF", err)
+		if _, err := r.ReadRaw(); err != io.EOF { //nolint:errorlint // A clean end of stream returns the exact EOF sentinel.
+			t.Fatalf("ReadRaw returned %v, want io.EOF", err)
 		}
 	})
 	t.Run("error", func(t *testing.T) {
 		t.Parallel()
-		_, err := NewReader[[]byte](nil)
+		_, err := NewReader(nil)
 		checkErrorContains(t, err, "nil record reader")
 	})
 }
 
 func TestReader(t *testing.T) {
 	t.Parallel()
-	t.Run("Records", func(t *testing.T) {
+	t.Run("ReadRaw", func(t *testing.T) {
+		t.Parallel()
+		t.Run("valid", func(t *testing.T) {
+			t.Parallel()
+			t.Run("large buffered message", func(t *testing.T) {
+				t.Parallel()
+				b := bytes.Repeat([]byte{0x08, 7}, 4369)
+				r, err := NewReader(framedRecords(b, []byte{0x08, 9}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := r.ReadRaw()
+				if err != nil || !bytes.Equal(got, b) {
+					t.Fatalf("ReadRaw with %d bytes = %d bytes, %v", len(b), len(got), err)
+				}
+				if got, err := r.ReadRaw(); err != nil || !bytes.Equal(got, []byte{0x08, 9}) {
+					t.Fatalf("following record = %x, %v", got, err)
+				}
+			})
+			t.Run("legacy page", func(t *testing.T) {
+				t.Parallel()
+				b, err := hex.DecodeString("50425001140000000700000028b52ffd2407390000020807000208092e67ee6c")
+				if err != nil {
+					t.Fatal(err)
+				}
+				p, err := page.NewReader(bytes.NewReader(b))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if err := p.Close(); err != nil {
+						t.Error(err)
+					}
+				})
+				r, err := NewReader(p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, want := range []uint64{7, 0, 9} {
+					var e streamEvent
+					if err := r.Read(&e); err != nil || e.Seq != want {
+						t.Fatalf("legacy sequence = %d, %v, want %d", e.Seq, err, want)
+					}
+				}
+				if _, err := r.ReadRaw(); err != io.EOF { //nolint:errorlint // Require a clean end of stream.
+					t.Fatalf("end of legacy stream = %v, want io.EOF", err)
+				}
+			})
+		})
+		t.Run("error", func(t *testing.T) {
+			t.Parallel()
+			for _, tt := range []struct {
+				name string
+				data []byte
+				want string
+			}{
+				{"truncated size", []byte{0x80}, "read record size: unexpected EOF"},
+				{"overflowing size", bytes.Repeat([]byte{0xff}, 10), "overflows a 64-bit integer"},
+				{"oversized record", binary.AppendUvarint(nil, 1<<31), "record size 2147483648 exceeds 2147483647 bytes"},
+				{"truncated small body", []byte{3, 0x08, 7}, "read record body: unexpected EOF"},
+				{"truncated maximum body", binary.AppendUvarint(nil, 1<<31-1), "read record body: unexpected EOF"},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					t.Parallel()
+					r, err := NewReader(bytes.NewReader(tt.data))
+					if err != nil {
+						t.Fatal(err)
+					}
+					m, err := r.ReadRaw()
+					checkErrorContains(t, err, tt.want)
+					if m != nil {
+						t.Fatalf("ReadRaw returned a partial message %x", m)
+					}
+					if n, retry := r.ReadRawTo(io.Discard); n != 0 || !errors.Is(retry, err) {
+						t.Fatalf("ReadRawTo after failed ReadRaw = %d, %v, want 0, %v", n, retry, err)
+					}
+				})
+			}
+		})
+	})
+	t.Run("ReadRawTo", func(t *testing.T) {
+		t.Parallel()
+		t.Run("valid", func(t *testing.T) {
+			t.Parallel()
+			t.Run("pending decode", func(t *testing.T) {
+				t.Parallel()
+				r, err := NewReader(framedRecords([]byte{0x08, 7}, nil, []byte{0x08, 9}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				type projection struct {
+					Sequence string `protobuf:"1"`
+				}
+				var p projection
+				checkErrorContains(t, r.Read(&p), "wire type 0, expected 2")
+				var dst bytes.Buffer
+				if n, err := r.ReadRawTo(&dst); n != 2 || err != nil || dst.String() != "\x08\x07" {
+					t.Fatalf("pending record = %d, %v, bytes %x", n, err, dst.Bytes())
+				}
+				if n, err := r.ReadRawTo(&dst); n != 0 || err != nil || dst.Len() != 2 {
+					t.Fatalf("empty record = %d, %v, destination %x", n, err, dst.Bytes())
+				}
+				var e streamEvent
+				if err := r.Read(&e); err != nil || e.Seq != 9 {
+					t.Fatalf("following record = %#v, %v", e, err)
+				}
+			})
+			t.Run("message across compressed pages", func(t *testing.T) {
+				t.Parallel()
+				const size = 17<<20 + 37
+				h := binary.AppendUvarint([]byte{0x1a}, size)
+				src := io.MultiReader(bytes.NewReader(h), readerFunc(func(p []byte) (int, error) {
+					for i := range p {
+						p[i] = 'a'
+					}
+					return len(p), nil
+				}))
+				want := sha256.New()
+				n := int64(size + len(h))
+				var dst bytes.Buffer
+				pw, err := page.NewWriter(&dst, 256<<10)
+				if err != nil {
+					t.Fatal(err)
+				}
+				w, err := NewWriter(pw)
+				if err != nil {
+					t.Fatal(errors.Join(err, pw.Close()))
+				}
+				if err := w.WriteRawFrom(io.TeeReader(src, want), n); err != nil {
+					t.Fatal(errors.Join(err, pw.Close()))
+				}
+				if err := errors.Join(w.Write(&streamEvent{Seq: 9}), pw.Close()); err != nil {
+					t.Fatal(err)
+				}
+				pr, err := page.NewReader(&dst)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if err := pr.Close(); err != nil {
+						t.Error(err)
+					}
+				})
+				r, err := NewReader(pr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := sha256.New()
+				if copied, err := r.ReadRawTo(got); err != nil || copied != n || !bytes.Equal(got.Sum(nil), want.Sum(nil)) {
+					t.Fatalf("ReadRawTo = %d, %v, digest %x, want %d bytes, digest %x", copied, err, got.Sum(nil), n, want.Sum(nil))
+				}
+				var e streamEvent
+				if err := r.Read(&e); err != nil || e.Seq != 9 {
+					t.Fatalf("following record = %#v, %v", e, err)
+				}
+			})
+		})
+		t.Run("error", func(t *testing.T) {
+			t.Parallel()
+			t.Run("nil destination", func(t *testing.T) {
+				t.Parallel()
+				r, err := NewReader(framedRecords([]byte{0x08, 7}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				n, err := r.ReadRawTo(nil)
+				checkErrorContains(t, err, "nil record destination")
+				if got, err := r.ReadRaw(); n != 0 || err != nil || !bytes.Equal(got, []byte{0x08, 7}) {
+					t.Fatalf("invalid copy returned %d bytes; subsequent record = %x, %v", n, got, err)
+				}
+			})
+			t.Run("truncated body", func(t *testing.T) {
+				t.Parallel()
+				r, err := NewReader(strings.NewReader("\x03\x08\x07"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var dst bytes.Buffer
+				n, err := r.ReadRawTo(&dst)
+				if n != 2 || !errors.Is(err, io.ErrUnexpectedEOF) || dst.String() != "\x08\x07" {
+					t.Fatalf("truncated record = %d, %v, bytes %x", n, err, dst.Bytes())
+				}
+				if got, retry := r.ReadRaw(); got != nil || !errors.Is(retry, err) {
+					t.Fatalf("ReadRaw after failed copy = %x, %v, want nil, %v", got, retry, err)
+				}
+			})
+			t.Run("destination error with full count", func(t *testing.T) {
+				t.Parallel()
+				r, err := NewReader(framedRecords([]byte{0x08, 7}, []byte{0x08, 9}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				w := writerFunc(func(b []byte) (int, error) { return len(b), io.EOF })
+				n, err := r.ReadRawTo(w)
+				if n != 2 || !errors.Is(err, io.EOF) || err == io.EOF { //nolint:errorlint // A destination EOF cannot end iteration cleanly.
+					t.Fatalf("ReadRawTo = %d, %v, want two bytes and wrapped EOF", n, err)
+				}
+				if got, retry := r.ReadRaw(); got != nil || !errors.Is(retry, err) {
+					t.Fatalf("ReadRaw after failed copy = %x, %v, want nil, %v", got, retry, err)
+				}
+			})
+			t.Run("short write of pending record", func(t *testing.T) {
+				t.Parallel()
+				r, err := NewReader(framedRecords([]byte{0x08, 7}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				type projection struct {
+					Sequence string `protobuf:"1"`
+				}
+				var p projection
+				checkErrorContains(t, r.Read(&p), "wire type 0, expected 2")
+				w := writerFunc(func([]byte) (int, error) { return 1, nil })
+				n, err := r.ReadRawTo(w)
+				if n != 1 || !errors.Is(err, io.ErrShortWrite) {
+					t.Fatalf("ReadRawTo = %d, %v, want one byte and io.ErrShortWrite", n, err)
+				}
+				if got, retry := r.ReadRaw(); got != nil || !errors.Is(retry, err) {
+					t.Fatalf("ReadRaw after failed copy = %x, %v, want nil, %v", got, retry, err)
+				}
+			})
+		})
+	})
+	t.Run("RawMessages", func(t *testing.T) {
 		t.Parallel()
 		t.Run("valid", func(t *testing.T) {
 			t.Parallel()
 			first := []byte{0x08, 7}
-			r, err := NewReader(&recordBuffer{records: [][]byte{first, {0x08, 9}, nil, {0x80}}})
+			r, err := NewReader(framedRecords(first, []byte{0x08, 9}, nil, []byte{0x80}))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -119,9 +424,9 @@ func TestReader(t *testing.T) {
 			var incompatible projection
 			checkErrorContains(t, r.Read(&incompatible), "wire type 0, expected 2")
 			var got streamEvent
-			for m, err := range r.Records() {
-				if err != nil || !bytes.Equal(m, first) || &m[0] != &first[0] {
-					t.Fatalf("Records yielded %x, %v, want the borrowed pending record %x", m, err, first)
+			for m, err := range r.RawMessages() {
+				if err != nil || !bytes.Equal(m, first) {
+					t.Fatalf("RawMessages yielded %x, %v, want pending record %x", m, err, first)
 				}
 				present, err := m.DecodeField(1, &got)
 				if err != nil || !present {
@@ -135,36 +440,36 @@ func TestReader(t *testing.T) {
 			if err := r.Read(&got); err != nil || got.Seq != 9 {
 				t.Fatalf("Read yielded %#v, %v, want sequence 9", got, err)
 			}
-			if b, err := r.ReadRecord(); err != nil || len(b) != 0 {
-				t.Fatalf("ReadRecord yielded %x, %v, want an empty message", b, err)
+			if b, err := r.ReadRaw(); err != nil || len(b) != 0 {
+				t.Fatalf("ReadRaw yielded %x, %v, want an empty message", b, err)
 			}
 			n := 0
-			for m, err := range r.Records() {
+			for m, err := range r.RawMessages() {
 				if err != nil || !bytes.Equal(m, []byte{0x80}) {
-					t.Fatalf("Records yielded %x, %v, want the unparsed bytes 80", m, err)
+					t.Fatalf("RawMessages yielded %x, %v, want the unparsed bytes 80", m, err)
 				}
 				n++
 			}
 			if n != 1 {
-				t.Fatalf("Records yielded %d messages, want one", n)
+				t.Fatalf("RawMessages yielded %d messages, want one", n)
 			}
 		})
 		t.Run("error", func(t *testing.T) {
 			t.Parallel()
 			wrapped := fmt.Errorf("reading record from storage: %w", io.EOF)
-			r, err := NewReader(&recordBuffer{err: wrapped})
+			r, err := NewReader(readerFunc(func([]byte) (int, error) { return 0, wrapped }))
 			if err != nil {
 				t.Fatal(err)
 			}
 			n := 0
-			for m, err := range r.Records() {
+			for m, err := range r.RawMessages() {
 				if !errors.Is(err, wrapped) || m != nil {
-					t.Fatalf("Records yielded %x, %v, want a nil message and %v", m, err, wrapped)
+					t.Fatalf("RawMessages yielded %x, %v, want a nil message and %v", m, err, wrapped)
 				}
 				n++
 			}
 			if n != 1 {
-				t.Fatalf("Records yielded %d results, want one", n)
+				t.Fatalf("RawMessages yielded %d results, want one", n)
 			}
 		})
 	})
@@ -175,9 +480,13 @@ func TestReader(t *testing.T) {
 			t.Parallel()
 			t.Run("invalid destinations can be retried", func(t *testing.T) {
 				t.Parallel()
-				r, err := NewReader(&recordBuffer{records: [][]byte{{0x08, 7}, nil, {0x08, 9}}})
+				r, err := NewReader(framedRecords([]byte{0x08, 4}, []byte{0x08, 7}, nil, []byte{0x08, 9}))
 				if err != nil {
 					t.Fatal(err)
+				}
+				var first streamEvent
+				if err := r.Read(&first); err != nil || first.Seq != 4 {
+					t.Fatalf("first record yielded %#v, %v, want sequence 4", first, err)
 				}
 				checkErrorContains(t, r.Read[streamEvent](nil), "nil record destination")
 				var dst string
@@ -196,11 +505,14 @@ func TestReader(t *testing.T) {
 						t.Fatalf("record %d yielded %#v, %v, want sequence %d", i, e, err, want)
 					}
 				}
+				if err := r.Read(&streamEvent{}); err != io.EOF { //nolint:errorlint // A clean end of stream returns the exact EOF sentinel.
+					t.Fatalf("Read returned %v, want io.EOF", err)
+				}
 			})
 			t.Run("malformed message stays pending", func(t *testing.T) {
 				t.Parallel()
 				// The first record contains only a field tag and omits its value.
-				r, err := NewReader(&recordBuffer{records: [][]byte{{0x08}, {0x08, 9}}})
+				r, err := NewReader(framedRecords([]byte{0x08}, []byte{0x08, 9}))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -216,63 +528,6 @@ func TestReader(t *testing.T) {
 					}
 				}
 			})
-		})
-	})
-
-	t.Run("Events", func(t *testing.T) {
-		t.Parallel()
-		t.Run("valid", func(t *testing.T) {
-			t.Parallel()
-			r, err := NewReader(&recordBuffer{records: [][]byte{{0x08, 7}, nil, {0x08, 9}}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			var first uint64
-			for e, err := range r.Events[streamEvent]() {
-				if err != nil {
-					t.Fatal(err)
-				}
-				first = e.Seq
-				break
-			}
-			if first != 7 {
-				t.Fatalf("first event sequence = %d, want 7", first)
-			}
-			type projection struct {
-				Sequence uint32 `protobuf:"1"`
-			}
-			next := projection{Sequence: 99}
-			if err := r.Read(&next); err != nil || next.Sequence != 0 {
-				t.Fatalf("resumed Read returned %#v, %v, want a zero value", next, err)
-			}
-			var got []uint32
-			for e, err := range r.Events[projection]() {
-				if err != nil {
-					t.Fatal(err)
-				}
-				got = append(got, e.Sequence)
-			}
-			if !reflect.DeepEqual(got, []uint32{9}) {
-				t.Fatalf("remaining sequences = %v, want [9]", got)
-			}
-		})
-		t.Run("error", func(t *testing.T) {
-			t.Parallel()
-			wrapped := fmt.Errorf("reading record from storage: %w", io.EOF)
-			r, err := NewReader(&recordBuffer{err: wrapped})
-			if err != nil {
-				t.Fatal(err)
-			}
-			n := 0
-			for e, err := range r.Events[streamEvent]() {
-				if !errors.Is(err, wrapped) || !reflect.DeepEqual(e, streamEvent{}) {
-					t.Fatalf("Events yielded %#v, %v, want a zero event and %v", e, err, wrapped)
-				}
-				n++
-			}
-			if n != 1 {
-				t.Fatalf("Events yielded %d results, want one", n)
-			}
 		})
 	})
 }
@@ -291,7 +546,7 @@ func BenchmarkWriter(b *testing.B) {
 						b.Error(err)
 					}
 				})
-				w, err := NewWriter[streamEvent](pw)
+				w, err := NewWriter(pw)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -327,7 +582,7 @@ func BenchmarkReader(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				w, err := NewWriter[streamEvent](pw)
+				w, err := NewWriter(pw)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -397,27 +652,23 @@ func benchmarkEvents(b *testing.B) (events []streamEvent, payloadBytes int64) {
 	return events, payloadBytes
 }
 
-type recordBuffer struct {
-	records [][]byte
-	err     error
+func framedRecords(records ...[]byte) *bytes.Reader {
+	var b []byte
+	for _, p := range records {
+		b = binary.AppendUvarint(b, uint64(len(p)))
+		b = append(b, p...)
+	}
+	return bytes.NewReader(b)
 }
 
-func (b *recordBuffer) ReadRecord() ([]byte, error) {
-	if b.err != nil {
-		return nil, b.err
-	}
-	if len(b.records) == 0 {
-		return nil, io.EOF
-	}
-	p := b.records[0]
-	b.records = b.records[1:]
-	return p, nil
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) {
+	return f(p)
 }
 
-func (b *recordBuffer) WriteRecord(p []byte) error {
-	if b.err != nil {
-		return b.err
-	}
-	b.records = append(b.records, bytes.Clone(p))
-	return nil
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) {
+	return f(p)
 }

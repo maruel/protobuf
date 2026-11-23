@@ -1,4 +1,4 @@
-// Package page stores sequences of byte records in independently compressed Zstandard pages.
+// Package page stores byte streams in independently compressed Zstandard pages.
 package page
 
 import (
@@ -11,7 +11,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// Writer buffers byte records into independently compressed Zstandard pages.
+// Writer buffers data into independently compressed Zstandard pages.
 // Use NewWriter to construct it and call its methods serially.
 type Writer struct {
 	dst    io.Writer
@@ -22,9 +22,8 @@ type Writer struct {
 	err    error
 }
 
-// NewWriter creates a page writer. The target size is in uncompressed bytes
-// including record lengths. Pass zero for 256 KiB.
-// A single record can exceed the target if it fits in a 16 MiB page.
+// NewWriter creates a page writer. The target size is in uncompressed bytes.
+// Pass zero for 256 KiB.
 func NewWriter(w io.Writer, pageSize int) (*Writer, error) {
 	if w == nil {
 		return nil, errors.New("page: nil page writer destination")
@@ -42,31 +41,28 @@ func NewWriter(w io.Writer, pageSize int) (*Writer, error) {
 	return &Writer{dst: w, enc: e, target: pageSize}, nil
 }
 
-// WriteRecord copies b into the pending page. A record can be empty. If a
-// record would exceed the target size, the writer flushes the pending page
-// before buffering it. An oversized record leaves the pending page intact.
-// An underlying write failure is returned by all subsequent operations
-// through Close.
-func (w *Writer) WriteRecord(b []byte) error {
+// Write buffers p as a byte stream in v2 pages, splitting writes at the
+// configured page size. It returns the number of bytes accepted. A write
+// failure from the underlying stream is terminal through Close.
+func (w *Writer) Write(p []byte) (int, error) {
 	if w.dst == nil {
-		return io.ErrClosedPipe
+		return 0, io.ErrClosedPipe
 	}
-	if w.err != nil {
-		return w.err
+	if w.err != nil || len(p) == 0 {
+		return 0, w.err
 	}
-	var hdr [binary.MaxVarintLen64]byte
-	prefix := binary.AppendUvarint(hdr[:0], uint64(len(b)))
-	if len(b) > maxPageSize-len(prefix) {
-		return fmt.Errorf("page: record exceeds the %d-byte page limit", maxPageSize)
-	}
-	if len(w.raw) != 0 && len(w.raw)+len(prefix)+len(b) > w.target {
-		if err := w.Flush(); err != nil {
-			return err
+	n := 0
+	for n < len(p) {
+		if len(w.raw) == w.target {
+			if err := w.Flush(); err != nil {
+				return n, err
+			}
 		}
+		k := min(w.target-len(w.raw), len(p)-n)
+		w.raw = append(w.raw, p[n:n+k]...)
+		n += k
 	}
-	w.raw = append(w.raw, prefix...)
-	w.raw = append(w.raw, b...)
-	return nil
+	return n, nil
 }
 
 // Flush emits the pending page to the underlying writer. The caller controls
@@ -80,8 +76,9 @@ func (w *Writer) Flush() error {
 	}
 	w.frame = w.enc.EncodeAll(w.raw, append(w.frame[:0], make([]byte, pageHeaderSize)...))
 	copy(w.frame, pageMagic)
+	w.frame[3] = byte(streamVersion)
 	binary.LittleEndian.PutUint32(w.frame[4:8], uint32(len(w.frame)-pageHeaderSize)) //nolint:gosec // Zstandard frame overhead keeps a page below the 17 MiB limit.
-	binary.LittleEndian.PutUint32(w.frame[8:12], uint32(len(w.raw)))                 //nolint:gosec // WriteRecord bounds the raw page to 16 MiB.
+	binary.LittleEndian.PutUint32(w.frame[8:12], uint32(len(w.raw)))                 //nolint:gosec // Write bounds the raw page to 16 MiB.
 	n, err := w.dst.Write(w.frame)
 	if err == nil && n != len(w.frame) {
 		err = io.ErrShortWrite
@@ -96,7 +93,7 @@ func (w *Writer) Flush() error {
 
 // Close flushes the pending page and releases the writer's buffers. The
 // caller retains ownership of the underlying writer.
-// Subsequent calls to WriteRecord, Flush, or Close return io.ErrClosedPipe.
+// Subsequent calls to Write, Flush or Close return io.ErrClosedPipe.
 func (w *Writer) Close() error {
 	if w.dst == nil {
 		return io.ErrClosedPipe
@@ -110,8 +107,8 @@ func (w *Writer) Close() error {
 	return err
 }
 
-// Reader reads byte records from a sequence of Zstandard pages. Use
-// NewReader to construct it and call its methods serially.
+// Reader reads data from a sequence of Zstandard pages. Use NewReader to
+// construct it and call its methods serially.
 type Reader struct {
 	src     io.Reader
 	dec     *zstd.Decoder
@@ -121,7 +118,7 @@ type Reader struct {
 	err     error
 }
 
-// NewReader creates a reader for a sequence of Zstandard pages.
+// NewReader creates a reader for a sequence of v1 or v2 Zstandard pages.
 func NewReader(r io.Reader) (*Reader, error) {
 	if r == nil {
 		return nil, errors.New("page: nil page reader source")
@@ -138,42 +135,31 @@ func NewReader(r io.Reader) (*Reader, error) {
 	return &Reader{src: r, dec: d}, nil
 }
 
-// ReadRecord returns the next record as a read-only slice valid until the
-// next call to ReadRecord or Close. Copy the bytes to keep them
-// longer. ReadRecord returns io.EOF at a clean end of stream, and wraps
-// io.ErrUnexpectedEOF for an incomplete page or record. End of stream, page
-// read errors, and invalid record lengths are terminal.
-func (r *Reader) ReadRecord() ([]byte, error) {
+// Read returns the decompressed byte stream. For legacy v1 pages, Read
+// validates the record framing and returns the payload including all length
+// prefixes. Read returns io.EOF at a clean end of stream. End of stream and
+// page read errors are terminal.
+func (r *Reader) Read(p []byte) (int, error) {
 	if r.src == nil {
-		return nil, io.ErrClosedPipe
+		return 0, io.ErrClosedPipe
 	}
-	if r.err != nil {
-		return nil, r.err
+	if r.err != nil || len(p) == 0 {
+		return 0, r.err
 	}
 	if len(r.pending) == 0 {
-		if err := r.readPage(); err != nil {
-			r.err = err
-			return nil, err
+		r.err = r.readPage()
+		if r.err != nil {
+			return 0, r.err
 		}
 	}
-	size, n := binary.Uvarint(r.pending)
-	if n < 0 || (n == 0 && len(r.pending) >= binary.MaxVarintLen64) {
-		r.err = errors.New("page: read record length: varint overflow")
-		return nil, r.err
-	}
-	b := r.pending[n:]
-	if n == 0 || size > uint64(len(b)) {
-		r.err = fmt.Errorf("page: read record length: %w", io.ErrUnexpectedEOF)
-		return nil, r.err
-	}
-	end := int(size) //nolint:gosec // The size fits in the slice.
-	r.pending = b[end:]
-	return b[:end:end], nil
+	n := copy(p, r.pending)
+	r.pending = r.pending[n:]
+	return n, nil
 }
 
 // Close releases the decoder and its buffers. The caller retains ownership
 // of the underlying reader.
-// Subsequent calls to ReadRecord or Close return io.ErrClosedPipe.
+// Subsequent calls to Read or Close return io.ErrClosedPipe.
 func (r *Reader) Close() error {
 	if r.src == nil {
 		return io.ErrClosedPipe
@@ -183,15 +169,24 @@ func (r *Reader) Close() error {
 	return nil
 }
 
-// An empty stream has no bytes. Each v1 page starts with PBP followed by 0x01,
-// then two unsigned 32-bit little-endian lengths for the compressed and raw
-// bytes, respectively. The compressed length counts the following Zstandard
-// payload. The writer emits one checksummed frame per page with no dictionary.
-// A raw page contains one or more records, each an unsigned base-128 varint
-// length followed by that many bytes. Zero-length records are valid.
+// An empty stream has no bytes. Each page starts with PBP and one version
+// byte, then unsigned 32-bit little-endian compressed and raw lengths.
+// The compressed length counts the following Zstandard payload. The
+// writer emits one checksummed frame per page with no dictionary.
+//
+// A v1 payload contains one or more complete records, each an unsigned
+// base-128 varint length followed by that many bytes. Zero-length records
+// are valid. A v2 payload is an arbitrary chunk of a byte stream.
 // The compressed and raw lengths are limited to 17 MiB and 16 MiB respectively.
+type pageVersion byte
+
 const (
-	pageMagic             = "PBP\x01"
+	legacyVersion pageVersion = 1
+	streamVersion pageVersion = 2
+)
+
+const (
+	pageMagic             = "PBP"
 	pageHeaderSize        = 12
 	defaultPageSize       = 256 << 10
 	maxPageSize           = 16 << 20
@@ -206,7 +201,8 @@ func (r *Reader) readPage() error {
 		}
 		return fmt.Errorf("page: read page header: %w", err)
 	}
-	if string(hdr[:4]) != pageMagic {
+	version := pageVersion(hdr[3])
+	if string(hdr[:3]) != pageMagic || (version != legacyVersion && version != streamVersion) {
 		return fmt.Errorf("page: invalid page magic or version %x", hdr[:4])
 	}
 	cl := binary.LittleEndian.Uint32(hdr[4:8])
@@ -231,6 +227,19 @@ func (r *Reader) readPage() error {
 	}
 	if len(b) != int(rl) {
 		return fmt.Errorf("page: raw page size %d does not match %d decoded bytes", rl, len(b))
+	}
+	if version == legacyVersion {
+		for rest := b; len(rest) != 0; {
+			size, n := binary.Uvarint(rest)
+			if n < 0 || (n == 0 && len(rest) >= binary.MaxVarintLen64) {
+				return errors.New("page: read record length: varint overflow")
+			}
+			rest = rest[n:]
+			if n == 0 || size > uint64(len(rest)) {
+				return fmt.Errorf("page: read record length: %w", io.ErrUnexpectedEOF)
+			}
+			rest = rest[size:]
+		}
 	}
 	r.pending = b
 	return nil

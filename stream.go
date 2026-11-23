@@ -1,86 +1,110 @@
 package protobuf
 
 import (
+	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"iter"
+	"math"
 	"reflect"
 )
 
-// RecordWriter accepts complete encoded messages. WriteRecord consumes or
-// copies the bytes during the call and leaves the input slice unchanged.
-// An empty slice represents an empty message.
-type RecordWriter interface {
-	WriteRecord(b []byte) error
+// Writer writes a stream of length-delimited protobuf records. Use NewWriter
+// to construct it and call its methods serially.
+type Writer struct {
+	dst    io.Writer
+	schema *message
+	buf    []byte
+	prefix [binary.MaxVarintLen32]byte
+	err    error
 }
 
-// Writer encodes messages of one named struct type and sends them to a
-// RecordWriter. Use NewWriter to construct it and call Write serially.
-type Writer[T any] struct {
-	dst    RecordWriter
-	msg    *message
-	record []byte
-}
-
-// NewWriter creates a writer for the named struct type T. The caller owns
-// the record destination, including any flushing or closing it requires.
-func NewWriter[T any](w RecordWriter) (*Writer[T], error) {
+// NewWriter creates a writer over w. The caller owns the destination,
+// including any flushing or closing it requires.
+func NewWriter(w io.Writer) (*Writer, error) {
 	if w == nil {
 		return nil, errors.New("protobuf: nil record writer")
 	}
-	m, err := messageFor(reflect.TypeFor[T]())
-	if err != nil {
-		return nil, err
-	}
-	return &Writer[T]{dst: w, msg: m}, nil
+	return &Writer{dst: w}, nil
 }
 
-// Write encodes v as one record and returns any error from the destination.
-// An encoding error leaves the destination untouched.
-func (w *Writer[T]) Write(v *T) error {
+// Write encodes a non-nil pointer to a named struct as one record. It
+// validates the struct type and buffers the encoded message. An encoding
+// error leaves the destination untouched. A destination error is terminal.
+func (w *Writer) Write[T any](v *T) error {
+	if w.err != nil {
+		return w.err
+	}
 	if v == nil {
 		return errors.New("protobuf: nil record")
 	}
-	b, err := w.msg.append(w.record[:0], reflect.ValueOf(v).Elem(), 0)
+	m := w.schema
+	if t := reflect.TypeFor[T](); m == nil || m.typ != t {
+		var err error
+		m, err = messageFor(t)
+		if err != nil {
+			return err
+		}
+		w.schema = m
+	}
+	b, err := m.append(w.buf[:0], reflect.ValueOf(v).Elem(), 0)
 	if err != nil {
 		return err
 	}
-	if err := w.dst.WriteRecord(b); err != nil {
-		return err
+	if len(b) > maxRecordSize {
+		return fmt.Errorf("protobuf: record size %d exceeds %d bytes", len(b), maxRecordSize)
 	}
-	w.record = b
-	return nil
+	w.buf = b
+	p := binary.AppendUvarint(w.prefix[:0], uint64(len(b)))
+	_, w.err = writeFull(w.dst, p)
+	if w.err == nil && len(b) != 0 {
+		_, w.err = writeFull(w.dst, b)
+	}
+	return w.err
 }
 
-// RecordReader supplies complete encoded messages as bytes. ReadRecord returns
-// a read-only slice valid until the next call and io.EOF at a clean end of
-// stream. An empty slice with a nil error represents an empty message.
-type RecordReader[B ~[]byte] interface {
-	ReadRecord() (B, error)
+// WriteRawFrom copies size bytes of an already encoded message from src
+// as one record. It uses bounded working memory and leaves any trailing bytes
+// in src unread. If src ends early, it returns io.ErrUnexpectedEOF. A read or
+// write error is terminal.
+func (w *Writer) WriteRawFrom(src io.Reader, size int64) error {
+	if w.err != nil {
+		return w.err
+	}
+	if src == nil {
+		return errors.New("protobuf: nil record source")
+	}
+	if size < 0 || size > maxRecordSize {
+		return fmt.Errorf("protobuf: record size %d is outside 0..%d bytes", size, maxRecordSize)
+	}
+	p := binary.AppendUvarint(w.prefix[:0], uint64(size))
+	_, w.err = writeFull(w.dst, p)
+	if w.err == nil && size != 0 {
+		_, w.err = copyRecord(w.dst, src, size)
+	}
+	return w.err
 }
 
-// Reader reads encoded records and can decode them into wire-compatible
-// named struct types. Use NewReader to construct it and call its methods
-// serially.
+// Reader reads length-delimited protobuf records and can decode them into
+// wire-compatible named struct types. Use NewReader to construct it and call
+// its methods serially.
 type Reader struct {
-	next   func() (RawMessage, error)
+	src    *bufio.Reader
+	schema *message
+	buf    []byte
 	record RawMessage
+	err    error
 }
 
-// NewReader creates a reader over a record source. The caller owns the
-// source and keeps it open for the reader's exclusive use. The source may
-// return []byte, RawMessage, or another byte slice type.
-func NewReader[B ~[]byte](r RecordReader[B]) (*Reader, error) {
+// NewReader creates a reader over r. The reader may buffer ahead. The caller
+// owns the source and keeps it open for the reader's exclusive use.
+func NewReader(r io.Reader) (*Reader, error) {
 	if r == nil {
 		return nil, errors.New("protobuf: nil record reader")
 	}
-	return &Reader{
-		next: func() (RawMessage, error) {
-			b, err := r.ReadRecord()
-			return RawMessage(b), err
-		},
-	}, nil
+	return &Reader{src: bufio.NewReader(r)}, nil
 }
 
 // Read replaces dst with the next decoded record and passes through errors
@@ -91,11 +115,16 @@ func (r *Reader) Read[T any](dst *T) error {
 	if dst == nil {
 		return errors.New("protobuf: nil record destination")
 	}
-	m, err := messageFor(reflect.TypeFor[T]())
-	if err != nil {
-		return err
+	m := r.schema
+	if t := reflect.TypeFor[T](); m == nil || m.typ != t {
+		var err error
+		m, err = messageFor(t)
+		if err != nil {
+			return err
+		}
+		r.schema = m
 	}
-	b, err := r.ReadRecord()
+	b, err := r.ReadRaw()
 	if err != nil {
 		return err
 	}
@@ -106,29 +135,70 @@ func (r *Reader) Read[T any](dst *T) error {
 	return nil
 }
 
-// ReadRecord returns the next encoded record, including a record pending
+// ReadRaw returns the next encoded record, including a record pending
 // after a failed Read. Its read-only bytes are valid until the next read
-// or until the source closes. A clean end of stream returns io.EOF.
-func (r *Reader) ReadRecord() (RawMessage, error) {
+// or until the source closes. It buffers the whole record. A clean end of
+// stream returns io.EOF. Framing and source errors are terminal.
+func (r *Reader) ReadRaw() (RawMessage, error) {
 	if r.record != nil {
 		b := r.record
 		r.record = nil
 		return b, nil
 	}
-	b, err := r.next()
+	n, err := r.readSize()
 	if err != nil {
 		return nil, err
 	}
-	return b, nil
+	if n <= r.src.Size() {
+		return r.readChunk(n)
+	}
+	b := r.buf[:0]
+	for len(b) < n {
+		p, err := r.readChunk(min(n-len(b), r.src.Size()))
+		if err != nil {
+			return nil, err
+		}
+		b = append(b, p...)
+	}
+	r.buf = b
+	return r.buf, nil
 }
 
-// Records iterates over the remaining encoded records. It shares the cursor
-// and the borrowed byte lifetime of ReadRecord. Each iteration yields a
+// ReadRawTo copies the next encoded record, including one pending after
+// a failed Read, to dst. It returns the number of message bytes written and
+// uses bounded working memory. Pass io.Discard to skip a record. A clean end
+// of stream returns io.EOF. Framing, source and destination errors are terminal.
+func (r *Reader) ReadRawTo(dst io.Writer) (int64, error) {
+	if dst == nil {
+		return 0, errors.New("protobuf: nil record destination")
+	}
+	if r.record != nil {
+		b := r.record
+		r.record = nil
+		n, err := writeFull(dst, b)
+		if err != nil {
+			r.err = fmt.Errorf("protobuf: copy record: %w", err)
+		}
+		return int64(n), r.err
+	}
+	n, err := r.readSize()
+	if err != nil || n == 0 {
+		return 0, err
+	}
+	c, err := copyRecord(dst, r.src, int64(n))
+	if err != nil {
+		r.err = fmt.Errorf("protobuf: copy record: %w", err)
+	}
+	return c, r.err
+}
+
+// RawMessages iterates over the remaining encoded messages. It shares the
+// cursor and the borrowed byte lifetime of ReadRaw. Each iteration yields a
 // non-EOF error once with a nil message and stops.
-func (r *Reader) Records() iter.Seq2[RawMessage, error] {
+func (r *Reader) RawMessages() iter.Seq2[RawMessage, error] {
 	return func(yield func(RawMessage, error) bool) {
 		for {
-			b, err := r.ReadRecord()
+			b, err := r.ReadRaw()
 			if err == io.EOF || !yield(b, err) || err != nil { //nolint:errorlint // A wrapped EOF is an input error and must reach the caller.
 				return
 			}
@@ -136,17 +206,51 @@ func (r *Reader) Records() iter.Seq2[RawMessage, error] {
 	}
 }
 
-// Events iterates over the remaining records. Each iteration yields any read
-// error other than io.EOF once with the zero value of T and stops. Breaking
-// after a record leaves the reader positioned at the next record.
-func (r *Reader) Events[T any]() iter.Seq2[T, error] {
-	return func(yield func(T, error) bool) {
-		for {
-			var v T
-			err := r.Read(&v)
-			if err == io.EOF || !yield(v, err) || err != nil { //nolint:errorlint // A wrapped EOF is an input error and must reach the caller.
-				return
-			}
-		}
+const maxRecordSize = math.MaxInt32
+
+func (r *Reader) readSize() (int, error) {
+	if r.err != nil {
+		return 0, r.err
 	}
+	n, err := binary.ReadUvarint(r.src)
+	switch {
+	case err == io.EOF: //nolint:errorlint // Only the exact EOF marks a clean end of stream.
+		r.err = err
+	case err != nil:
+		r.err = fmt.Errorf("protobuf: read record size: %w", err)
+	case n > maxRecordSize:
+		r.err = fmt.Errorf("protobuf: record size %d exceeds %d bytes", n, maxRecordSize)
+	default:
+		return int(n), nil
+	}
+	return 0, r.err
+}
+
+func (r *Reader) readChunk(n int) (RawMessage, error) {
+	b, err := r.src.Peek(n)
+	if err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		r.err = fmt.Errorf("protobuf: read record body: %w", err)
+		return nil, r.err
+	}
+	_, _ = r.src.Discard(n) // Peek ensured that n bytes are already buffered.
+	return b, nil
+}
+
+func writeFull(w io.Writer, b []byte) (int, error) {
+	n, err := w.Write(b)
+	if err == nil && n != len(b) {
+		err = io.ErrShortWrite
+	}
+	return n, err
+}
+
+func copyRecord(dst io.Writer, src io.Reader, size int64) (int64, error) {
+	n, err := io.Copy(dst, io.LimitReader(src, size))
+	if err == nil && n != size {
+		err = io.ErrUnexpectedEOF
+	}
+	return n, err
 }

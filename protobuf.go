@@ -19,9 +19,10 @@
 // nil. Repeated message elements may be values or non-nil pointers. Keep field
 // numbers and their wire types stable across revisions.
 //
-// Writer and Reader encode and decode streams of complete protobuf records.
-// Their source and destination can be provided by the page subpackage for
-// independently compressed Zstandard storage.
+// Writer and Reader frame records over io.Writer and io.Reader. Each record
+// consists of the unsigned varint size followed by the encoded message. The
+// encoded message must be smaller than 2 GiB. The page subpackage compresses
+// the stream in independent Zstandard pages. A record can span multiple pages.
 package protobuf
 
 import (

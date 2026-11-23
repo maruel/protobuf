@@ -35,7 +35,7 @@ func ExampleWriter() {
 	if err != nil {
 		panic(err)
 	}
-	w, err := protobuf.NewWriter[Event](pw)
+	w, err := protobuf.NewWriter(pw)
 	if err != nil {
 		panic(errors.Join(err, pw.Close()))
 	}
@@ -59,8 +59,12 @@ func ExampleWriter() {
 	if err != nil {
 		panic(err)
 	}
-	for event, err := range r.Events[Event]() {
+	for raw, err := range r.RawMessages() {
 		if err != nil {
+			panic(err)
+		}
+		var event Event
+		if err := raw.Decode(&event); err != nil {
 			panic(err)
 		}
 		fmt.Println(event.Sequence, event.Text)

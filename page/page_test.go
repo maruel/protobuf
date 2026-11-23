@@ -6,8 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -16,176 +14,125 @@ import (
 
 func TestWriter(t *testing.T) {
 	t.Parallel()
-	t.Run("WriteRecord", func(t *testing.T) {
+	t.Run("Write", func(t *testing.T) {
 		t.Parallel()
 		t.Run("valid", func(t *testing.T) {
 			t.Parallel()
-			t.Run("version one framing", func(t *testing.T) {
-				t.Parallel()
-				var dst bytes.Buffer
-				w, err := NewWriter(&dst, 0)
-				if err != nil {
-					t.Fatal(err)
+			var dst bytes.Buffer
+			w, err := NewWriter(&dst, 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n, err := w.Write([]byte{0xff, 0xfe}); n != 2 || err != nil {
+				t.Fatalf("Write returned %d, %v, want 2, nil", n, err)
+			}
+			p := []byte("abcdefghijk")
+			if n, err := w.Write(p); n != len(p) || err != nil {
+				t.Fatalf("Write returned %d, %v, want %d, nil", n, err, len(p))
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			wire := dst.Bytes()
+			for i, rawSize := range []uint32{4, 4, 4, 1} {
+				if len(wire) < 12 || string(wire[:4]) != "PBP\x02" || binary.LittleEndian.Uint32(wire[8:12]) != rawSize {
+					t.Fatalf("invalid v2 header for page %d in %x", i, wire)
 				}
-				record := bytes.Repeat([]byte{0xff}, 130)
-				if err := w.WriteRecord(record); err != nil {
-					t.Fatal(err)
+				compressedSize := binary.LittleEndian.Uint32(wire[4:8])
+				if compressedSize == 0 || int64(compressedSize) > int64(len(wire)-12) {
+					t.Fatalf("invalid compressed size %d for page %d", compressedSize, i)
 				}
-				clear(record)
-				if err := w.WriteRecord(nil); err != nil {
-					t.Fatal(err)
-				}
-				if err := w.Close(); err != nil {
-					t.Fatal(err)
-				}
-				wire := dst.Bytes()
-				if len(wire) < 12 || string(wire[:4]) != "PBP\x01" ||
-					int(binary.LittleEndian.Uint32(wire[4:8])) != len(wire)-12 ||
-					binary.LittleEndian.Uint32(wire[8:12]) != 133 {
-					t.Fatalf("unexpected v1 page header in %x", wire)
-				}
-				dec, err := zstd.NewReader(nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(dec.Close)
-				got, err := dec.DecodeAll(wire[12:], nil)
-				want := append([]byte{0x82, 0x01}, bytes.Repeat([]byte{0xff}, 130)...)
-				want = append(want, 0)
-				if err != nil || !bytes.Equal(got, want) {
-					t.Fatalf("page payload = %x, %v, want %x", got, err, want)
-				}
-			})
-			t.Run("multi-page file", func(t *testing.T) {
-				t.Parallel()
-				f, err := os.Create(filepath.Join(t.TempDir(), "events.pbz"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() {
-					if err := f.Close(); err != nil {
-						t.Error(err)
-					}
-				})
-				w, err := NewWriter(f, 3)
-				if err != nil {
-					t.Fatal(err)
-				}
-				want := [][]byte{{0x08, 7}, {}, {0xff, 0x80, 1, 2}}
-				for i := range want[:2] {
-					if err := w.WriteRecord(want[i]); err != nil {
-						t.Fatal(err)
-					}
-				}
-				first, err := f.Seek(0, io.SeekCurrent)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if first == 0 {
-					t.Fatal("rolling over the page wrote no bytes")
-				}
-				if err := w.Flush(); err != nil {
-					t.Fatal(err)
-				}
-				second, err := f.Seek(0, io.SeekCurrent)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if second <= first {
-					t.Fatal("flushing pending records wrote no bytes")
-				}
-				if err := w.WriteRecord(want[2]); err != nil {
-					t.Fatal(err)
-				}
-				if err := w.Close(); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := f.Seek(0, io.SeekStart); err != nil {
-					t.Fatal(err)
-				}
-				r, err := NewReader(f)
-				if err != nil {
-					t.Fatal(err)
-				}
-				checkPageRecords(t, r, want)
-				if err := r.Close(); err != nil {
-					t.Fatal(err)
-				}
-			})
+				wire = wire[12+compressedSize:]
+			}
+			if len(wire) != 0 {
+				t.Fatalf("unexpected trailing %d bytes", len(wire))
+			}
+			r, err := NewReader(&dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = r.Close() })
+			var first [1]byte
+			if n, err := r.Read(first[:]); n != 1 || first[0] != 0xff || err != nil {
+				t.Fatalf("Read returned %d, %v and wrote %x, want 1, nil and ff", n, err, first)
+			}
+			got, err := io.ReadAll(r)
+			want := append([]byte{0xfe}, p...)
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("remaining bytes = %x, %v, want %x", got, err, want)
+			}
+			if n, err := r.Read(first[:]); n != 0 || !errors.Is(err, io.EOF) {
+				t.Fatalf("Read after EOF returned %d, %v, want 0, EOF", n, err)
+			}
 		})
-
 		t.Run("error", func(t *testing.T) {
 			t.Parallel()
-			t.Run("oversized input preserves pending records", func(t *testing.T) {
-				t.Parallel()
-				var b bytes.Buffer
-				w, err := NewWriter(&b, 1)
-				if err != nil {
-					t.Fatal(err)
-				}
-				want := [][]byte{{0x08, 7}, {0x08, 9}}
-				if err := w.WriteRecord(want[0]); err != nil {
-					t.Fatal(err)
-				}
-				checkErrorContains(t, w.WriteRecord(make([]byte, 16<<20)), "record exceeds the 16777216-byte page limit")
-				if b.Len() != 0 {
-					t.Fatal("rejected input published the pending page")
-				}
-				if err := w.WriteRecord(want[1]); err != nil {
-					t.Fatal(err)
-				}
-				if err := w.Close(); err != nil {
-					t.Fatal(err)
-				}
-				r, err := NewReader(&b)
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { _ = r.Close() })
-				checkPageRecords(t, r, want)
-			})
-			t.Run("short write during rollover is terminal", func(t *testing.T) {
+			t.Run("reports accepted bytes on short write", func(t *testing.T) {
 				t.Parallel()
 				var dst shortPageWriter
 				w, err := NewWriter(&dst, 3)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := w.WriteRecord([]byte{0x08, 7}); err != nil {
-					t.Fatal(err)
-				}
-				if err := w.Flush(); err != nil {
-					t.Fatal(err)
-				}
-				if err := w.WriteRecord([]byte{0x08, 9}); err != nil {
-					t.Fatal(err)
+				if n, err := w.Write([]byte("ab")); n != 2 || err != nil {
+					t.Fatalf("Write returned %d, %v, want 2, nil", n, err)
 				}
 				dst.truncateNext = true
-				err = w.WriteRecord([]byte{0x08, 11})
-				if !errors.Is(err, io.ErrShortWrite) {
-					t.Fatalf("WriteRecord returned %v, want io.ErrShortWrite", err)
+				if n, err := w.Write([]byte("cdef")); n != 1 || !errors.Is(err, io.ErrShortWrite) {
+					t.Fatalf("Write returned %d, %v, want 1, short write", n, err)
 				}
-				n := dst.Len()
-				for _, got := range []error{w.WriteRecord(nil), w.Flush(), w.Close()} {
-					if !errors.Is(got, io.ErrShortWrite) {
-						t.Fatalf("operation after a short write returned %v, want io.ErrShortWrite", got)
-					}
+				size := dst.Len()
+				if n, err := w.Write([]byte("d")); n != 0 || !errors.Is(err, io.ErrShortWrite) {
+					t.Fatalf("Write after failure returned %d, %v, want 0, short write", n, err)
 				}
-				if dst.Len() != n {
+				if err := w.Close(); !errors.Is(err, io.ErrShortWrite) {
+					t.Fatalf("Close after failure returned %v, want short write", err)
+				}
+				if dst.Len() != size {
 					t.Fatal("operation after a short write produced more data")
 				}
-				r, err := NewReader(&dst.Buffer)
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { _ = r.Close() })
-				if b, err := r.ReadRecord(); err != nil || !bytes.Equal(b, []byte{0x08, 7}) {
-					t.Fatalf("previous page yielded %x, %v, want 0807", b, err)
-				}
-				if _, err := r.ReadRecord(); !errors.Is(err, io.ErrUnexpectedEOF) {
-					t.Fatalf("truncated tail returned %v, want io.ErrUnexpectedEOF", err)
-				}
 			})
+		})
+	})
+	t.Run("Flush", func(t *testing.T) {
+		t.Parallel()
+		t.Run("valid", func(t *testing.T) {
+			t.Parallel()
+			var dst bytes.Buffer
+			w, err := NewWriter(&dst, 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n, err := w.Write(nil); n != 0 || err != nil {
+				t.Fatalf("Write(nil) returned %d, %v, want 0, nil", n, err)
+			}
+			if n, err := w.Write([]byte("ab")); n != 2 || err != nil {
+				t.Fatalf("Write returned %d, %v, want 2, nil", n, err)
+			}
+			if dst.Len() != 0 {
+				t.Fatal("Write published an incomplete page before Flush")
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if dst.Len() == 0 {
+				t.Fatal("Flush published no bytes")
+			}
+			if n, err := w.Write([]byte("c")); n != 1 || err != nil {
+				t.Fatalf("Write after Flush returned %d, %v, want 1, nil", n, err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			r, err := NewReader(&dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = r.Close() })
+			b, err := io.ReadAll(r)
+			if string(b) != "abc" || err != nil {
+				t.Fatalf("stream bytes = %q, %v, want abc, nil", b, err)
+			}
 		})
 	})
 
@@ -214,7 +161,10 @@ func TestWriter(t *testing.T) {
 			if err := w.Close(); err != nil {
 				t.Fatal(err)
 			}
-			for _, err := range []error{w.WriteRecord([]byte{0x08, 1}), w.Flush(), w.Close()} {
+			if n, err := w.Write([]byte{1}); n != 0 || !errors.Is(err, io.ErrClosedPipe) {
+				t.Fatalf("Write after Close returned %d, %v, want 0, closed pipe", n, err)
+			}
+			for _, err := range []error{w.Flush(), w.Close()} {
 				if !errors.Is(err, io.ErrClosedPipe) {
 					t.Fatalf("operation on closed writer returned %v, want io.ErrClosedPipe", err)
 				}
@@ -247,19 +197,44 @@ func TestNewReader(t *testing.T) {
 
 func TestReader(t *testing.T) {
 	t.Parallel()
-	t.Run("ReadRecord", func(t *testing.T) {
+	t.Run("Read", func(t *testing.T) {
 		t.Parallel()
 		t.Run("valid", func(t *testing.T) {
 			t.Parallel()
-			r, err := NewReader(bytes.NewReader(pageFixture(t)))
+			legacy := pageFixture(t)
+			stream := pageFixture(t)
+			stream[3] = 2
+			r, err := NewReader(bytes.NewReader(append(legacy, stream...)))
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = r.Close() })
-			checkPageRecords(t, r, [][]byte{{0x08, 7}, nil, {0x08, 9}})
+			if n, err := r.Read(nil); n != 0 || err != nil {
+				t.Fatalf("Read(nil) returned %d, %v, want 0, nil", n, err)
+			}
+			got, err := io.ReadAll(r)
+			want := bytes.Repeat([]byte{2, 8, 7, 0, 2, 8, 9}, 2)
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("stream bytes = %x, %v, want %x", got, err, want)
+			}
 		})
 		t.Run("error", func(t *testing.T) {
 			t.Parallel()
+			t.Run("truncated v2 tail", func(t *testing.T) {
+				t.Parallel()
+				page := pageFixture(t)
+				page[3] = 2
+				r, err := NewReader(bytes.NewReader(append(bytes.Clone(page), page[:len(page)-1]...)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = r.Close() })
+				got, err := io.ReadAll(r)
+				want := []byte{2, 8, 7, 0, 2, 8, 9}
+				if !errors.Is(err, io.ErrUnexpectedEOF) || !bytes.Equal(got, want) {
+					t.Fatalf("stream bytes = %x, %v, want %x and unexpected EOF", got, err, want)
+				}
+			})
 			b := pageFixture(t)
 			replace := func(i int, v byte) []byte {
 				p := bytes.Clone(b)
@@ -278,9 +253,10 @@ func TestReader(t *testing.T) {
 				is   error
 				msg  string
 			}{
+				{name: "short header", data: b[:3], is: io.ErrUnexpectedEOF, msg: "read page header"},
 				{name: "missing payload", data: b[:12], is: io.ErrUnexpectedEOF, msg: "read page payload"},
 				{name: "short payload", data: b[:len(b)-1], is: io.ErrUnexpectedEOF, msg: "read page payload"},
-				{name: "unsupported version", data: replace(3, 2), msg: "invalid page magic or version"},
+				{name: "unsupported version", data: replace(3, 3), msg: "invalid page magic or version"},
 				{name: "zero compressed size", data: replace(4, 0), msg: "invalid compressed page size"},
 				{name: "huge compressed size", data: replace(7, 2), msg: "invalid compressed page size"},
 				{name: "zero raw size", data: replace(8, 0), msg: "invalid raw page size"},
@@ -299,16 +275,17 @@ func TestReader(t *testing.T) {
 						t.Fatal(err)
 					}
 					t.Cleanup(func() { _ = r.Close() })
-					b, first := r.ReadRecord()
-					if b != nil {
-						t.Fatalf("ReadRecord returned bytes %x with an error", b)
+					var p [1]byte
+					n, first := r.Read(p[:])
+					if n != 0 {
+						t.Fatalf("Read returned %d bytes with an error", n)
 					}
 					if tc.is != nil && !errors.Is(first, tc.is) {
-						t.Fatalf("ReadRecord returned %v, want %v", first, tc.is)
+						t.Fatalf("Read returned %v, want %v", first, tc.is)
 					}
 					checkErrorContains(t, first, tc.msg)
-					if _, err := r.ReadRecord(); err != first { //nolint:errorlint // A terminal error is returned unchanged.
-						t.Fatalf("ReadRecord after a terminal error returned %v, want %v", err, first)
+					if n, err := r.Read(p[:]); n != 0 || err != first { //nolint:errorlint // A terminal error is returned unchanged.
+						t.Fatalf("Read after a terminal error returned %d, %v, want 0, %v", n, err, first)
 					}
 				})
 			}
@@ -323,14 +300,15 @@ func TestReader(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := r.ReadRecord(); err != nil {
-				t.Fatal(err)
+			var p [1]byte
+			if n, err := r.Read(p[:]); n != 1 || err != nil {
+				t.Fatalf("Read returned %d, %v before Close", n, err)
 			}
 			if err := r.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := r.ReadRecord(); !errors.Is(err, io.ErrClosedPipe) {
-				t.Fatalf("ReadRecord after Close returned %v, want io.ErrClosedPipe", err)
+			if n, err := r.Read(p[:]); n != 0 || !errors.Is(err, io.ErrClosedPipe) {
+				t.Fatalf("Read after Close returned %d, %v, want 0, closed pipe", n, err)
 			}
 			if err := r.Close(); !errors.Is(err, io.ErrClosedPipe) {
 				t.Fatalf("Close returned %v, want io.ErrClosedPipe", err)
@@ -364,18 +342,6 @@ func decodePageFixture(t *testing.T, s string) []byte {
 		t.Fatal(err)
 	}
 	return b
-}
-
-func checkPageRecords(t *testing.T, r *Reader, want [][]byte) {
-	for i, expected := range want {
-		got, err := r.ReadRecord()
-		if err != nil || !bytes.Equal(got, expected) {
-			t.Fatalf("record %d = %x, %v, want %x", i, got, err, expected)
-		}
-	}
-	if _, err := r.ReadRecord(); err != io.EOF { //nolint:errorlint // A clean page boundary returns the exact EOF sentinel.
-		t.Fatalf("after %d records, ReadRecord returned %v, want io.EOF", len(want), err)
-	}
 }
 
 func checkErrorContains(t *testing.T, err error, want string) {
