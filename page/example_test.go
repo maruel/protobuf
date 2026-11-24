@@ -3,47 +3,66 @@ package page_test
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/maruel/protobuf"
 	"github.com/maruel/protobuf/page"
 )
 
-func ExampleWriter() {
+func ExampleStreamReader() {
 	type Event struct {
 		Sequence uint64 `protobuf:"1,name=sequence"`
 		Text     string `protobuf:"2,name=text"`
 	}
 
-	f, err := os.CreateTemp("", "events-*.pbz")
+	dir, err := os.MkdirTemp("", "daily-events-*")
 	if err != nil {
 		panic(err)
 	}
 	defer func() {
-		if err := os.Remove(f.Name()); err != nil {
+		if err := os.RemoveAll(dir); err != nil {
 			panic(err)
 		}
 	}()
+
+	for _, day := range []struct {
+		date   string
+		events []Event
+	}{
+		{"2026-11-02", []Event{{Sequence: 1, Text: "started"}}},
+		{"2026-11-03", []Event{{Sequence: 2, Text: "started"}, {Sequence: 3, Text: "finished"}}},
+	} {
+		f, err := os.Create(filepath.Join(dir, day.date+".pbz")) //nolint:gosec // The day names are fixed and dir is temporary.
+		if err != nil {
+			panic(err)
+		}
+		pw, err := page.NewStreamWriter(f, 0)
+		if err != nil {
+			panic(errors.Join(err, f.Close()))
+		}
+		w := protobuf.NewWriter(pw)
+		for i := range day.events {
+			if err := w.Write(&day.events[i]); err != nil {
+				panic(errors.Join(err, pw.Close(), f.Close()))
+			}
+		}
+		if err := errors.Join(pw.Close(), f.Close()); err != nil {
+			panic(err)
+		}
+	}
+
+	// Open the selected day's stream directly.
+	f, err := os.Open(filepath.Join(dir, "2026-11-03.pbz")) //nolint:gosec // The day name is fixed and dir is temporary.
+	if err != nil {
+		panic(err)
+	}
 	defer func() {
 		if err := f.Close(); err != nil {
 			panic(err)
 		}
 	}()
-
-	pw, err := page.NewWriter(f, 0)
-	if err != nil {
-		panic(err)
-	}
-	w := protobuf.NewWriter(pw)
-	if err := errors.Join(w.Write(&Event{Sequence: 1, Text: "started"}), pw.Close()); err != nil {
-		panic(err)
-	}
-
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		panic(err)
-	}
-	pr, err := page.NewReader(f)
+	pr, err := page.NewStreamReader(f)
 	if err != nil {
 		panic(err)
 	}
@@ -53,11 +72,14 @@ func ExampleWriter() {
 		}
 	}()
 	r := protobuf.NewReader(pr)
-	for event, err := range r.Iter[Event]() {
+	for e, err := range r.Iter[Event]() {
 		if err != nil {
 			panic(err)
 		}
-		fmt.Println(event.Sequence, event.Text)
+		fmt.Println(e.Sequence, e.Text)
 	}
-	// Output: 1 started
+
+	// Output:
+	// 2 started
+	// 3 finished
 }

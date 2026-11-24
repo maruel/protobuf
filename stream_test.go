@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -193,32 +192,6 @@ func TestReader(t *testing.T) {
 					t.Fatalf("following record = %x, %v", got, err)
 				}
 			})
-			t.Run("legacy page", func(t *testing.T) {
-				t.Parallel()
-				b, err := hex.DecodeString("50425001140000000700000028b52ffd2407390000020807000208092e67ee6c")
-				if err != nil {
-					t.Fatal(err)
-				}
-				p, err := page.NewReader(bytes.NewReader(b))
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() {
-					if err := p.Close(); err != nil {
-						t.Error(err)
-					}
-				})
-				r := NewReader(p)
-				for _, want := range []uint64{7, 0, 9} {
-					var e streamEvent
-					if err := r.Read(&e); err != nil || e.Seq != want {
-						t.Fatalf("legacy sequence = %d, %v, want %d", e.Seq, err, want)
-					}
-				}
-				if _, err := r.ReadRaw(); err != io.EOF { //nolint:errorlint // Require a clean end of stream.
-					t.Fatalf("end of legacy stream = %v, want io.EOF", err)
-				}
-			})
 		})
 		t.Run("error", func(t *testing.T) {
 			t.Parallel()
@@ -273,7 +246,7 @@ func TestReader(t *testing.T) {
 				want := sha256.New()
 				n := int64(size + len(h))
 				var dst bytes.Buffer
-				pw, err := page.NewWriter(&dst, 256<<10)
+				pw, err := page.NewStreamWriter(&dst, 256<<10)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -284,7 +257,7 @@ func TestReader(t *testing.T) {
 				if err := errors.Join(w.Write(&streamEvent{Seq: 9}), pw.Close()); err != nil {
 					t.Fatal(err)
 				}
-				pr, err := page.NewReader(&dst)
+				pr, err := page.NewStreamReader(&dst)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -621,7 +594,7 @@ func BenchmarkWriter(b *testing.B) {
 	b.Run("Write", func(b *testing.B) {
 		for _, size := range []int{16 << 10, 256 << 10} {
 			b.Run(fmt.Sprintf("%dKiB", size>>10), func(b *testing.B) {
-				pw, err := page.NewWriter(io.Discard, size)
+				pw, err := page.NewStreamWriter(io.Discard, size)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -659,7 +632,7 @@ func BenchmarkReader(b *testing.B) {
 		for _, size := range []int{16 << 10, 256 << 10} {
 			b.Run(fmt.Sprintf("%dKiB", size>>10), func(b *testing.B) {
 				var dst bytes.Buffer
-				pw, err := page.NewWriter(&dst, size)
+				pw, err := page.NewStreamWriter(&dst, size)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -674,7 +647,7 @@ func BenchmarkReader(b *testing.B) {
 				}
 				data := dst.Bytes()
 				src := bytes.NewReader(data)
-				pr, err := page.NewReader(src)
+				pr, err := page.NewStreamReader(src)
 				if err != nil {
 					b.Fatal(err)
 				}
