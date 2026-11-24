@@ -418,6 +418,105 @@ message schemaChild {
 
 func TestRawMessage(t *testing.T) {
 	t.Parallel()
+	t.Run("Iter", func(t *testing.T) {
+		t.Parallel()
+		t.Run("valid", func(t *testing.T) {
+			t.Parallel()
+			t.Run("wire order and borrowed values", func(t *testing.T) {
+				t.Parallel()
+				m := RawMessage{
+					0x30, 1,
+					0x32, 3, 0, 0x96, 1,
+					0x30, 2,
+					0x15, 1, 2, 3, 4,
+					0x19, 1, 2, 3, 4, 5, 6, 7, 8,
+					0x23, 0x08, 1, 0x24,
+					0xf8, 0xff, 0xff, 0xff, 0x0f, 0,
+				}
+				fields := m.Iter()
+				for f, err := range fields {
+					if err != nil || f.Number != 6 {
+						t.Fatalf("first field = %+v, %v, want field 6", f, err)
+					}
+					break
+				}
+				var got []Field
+				for f, err := range fields {
+					if err != nil {
+						t.Fatal(err)
+					}
+					got = append(got, f)
+				}
+				want := []Field{
+					{Number: 6, WireType: protowire.VarintType, Value: []byte{1}},
+					{Number: 6, WireType: protowire.BytesType, Value: []byte{3, 0, 0x96, 1}},
+					{Number: 6, WireType: protowire.VarintType, Value: []byte{2}},
+					{Number: 2, WireType: protowire.Fixed32Type, Value: []byte{1, 2, 3, 4}},
+					{Number: 3, WireType: protowire.Fixed64Type, Value: []byte{1, 2, 3, 4, 5, 6, 7, 8}},
+					{Number: 4, WireType: protowire.StartGroupType, Value: []byte{0x08, 1, 0x24}},
+					{Number: 1<<29 - 1, WireType: protowire.VarintType, Value: []byte{0}},
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("Iter yielded %+v, want %+v", got, want)
+				}
+				if &got[0].Value[0] != &m[1] {
+					t.Fatal("field value did not borrow the original bytes")
+				}
+			})
+			t.Run("empty message", func(t *testing.T) {
+				t.Parallel()
+				for f, err := range RawMessage(nil).Iter() {
+					t.Fatalf("empty message yielded %+v, %v", f, err)
+				}
+			})
+		})
+		t.Run("error", func(t *testing.T) {
+			t.Parallel()
+			t.Run("truncated value after a valid field", func(t *testing.T) {
+				t.Parallel()
+				m := RawMessage{0x08, 5, 0x12, 2, 'x'}
+				n := 0
+				for f, err := range m.Iter() {
+					if n == 0 {
+						if err != nil || f.Number != 1 || !bytes.Equal(f.Value, []byte{5}) {
+							t.Fatalf("first field = %+v, %v, want field 1 with value 5", f, err)
+						}
+					} else if n != 1 || !reflect.DeepEqual(f, Field{}) || !errors.Is(err, io.ErrUnexpectedEOF) {
+						t.Fatalf("result %d = %+v, %v, want a zero Field and io.ErrUnexpectedEOF", n, f, err)
+					}
+					n++
+				}
+				if n != 2 {
+					t.Fatalf("Iter yielded %d results, want one field and one error", n)
+				}
+			})
+			for _, tc := range []struct {
+				name string
+				raw  RawMessage
+				err  string
+			}{
+				{"truncated tag", RawMessage{0x80}, "read field tag: unexpected EOF"},
+				{"field number above the limit", RawMessage{0x80, 0x80, 0x80, 0x80, 0x10, 1}, "invalid field number 536870912"},
+				{"reserved wire type", RawMessage{0x0e}, "reserved wire type"},
+				{"mismatched group", RawMessage{0x0b, 0x14}, "mismatching end group marker"},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
+					n := 0
+					for f, err := range tc.raw.Iter() {
+						if n != 0 || !reflect.DeepEqual(f, Field{}) {
+							t.Fatalf("result %d = %+v, %v, want a zero Field on error", n, f, err)
+						}
+						checkErrorContains(t, err, tc.err)
+						n++
+					}
+					if n != 1 {
+						t.Fatalf("Iter yielded %d results, want one error", n)
+					}
+				})
+			}
+		})
+	})
 	t.Run("Decode", func(t *testing.T) {
 		t.Parallel()
 		t.Run("error", func(t *testing.T) {
@@ -578,14 +677,30 @@ func BenchmarkUnmarshal(b *testing.B) {
 }
 
 func BenchmarkRawMessage(b *testing.B) {
-	b.Run("DecodeField", func(b *testing.B) {
-		v := benchmarkWireEvent()
-		data, err := Append(nil, &v)
-		if err != nil {
-			b.Fatal(err)
+	v := benchmarkWireEvent()
+	data, err := Append(nil, &v)
+	if err != nil {
+		b.Fatal(err)
+	}
+	m := RawMessage(data)
+	b.Run("Iter", func(b *testing.B) {
+		b.SetBytes(int64(len(m)))
+		b.ReportAllocs()
+		for b.Loop() {
+			n := 0
+			for f, err := range m.Iter() {
+				if err != nil {
+					b.Fatal(err)
+				}
+				n += len(f.Value)
+			}
+			if n == 0 {
+				b.Fatal("Iter yielded no value bytes")
+			}
 		}
-		m := RawMessage(data)
-		b.SetBytes(int64(len(data)))
+	})
+	b.Run("DecodeField", func(b *testing.B) {
+		b.SetBytes(int64(len(m)))
 		b.ReportAllocs()
 		var dst wireEvent
 		for b.Loop() {

@@ -29,6 +29,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"iter"
 	"reflect"
 	"slices"
 	"strconv"
@@ -87,6 +88,17 @@ func Schema[T any]() (string, error) {
 	return b.String(), nil
 }
 
+// Field is one occurrence of a field in a protobuf message's wire encoding.
+type Field struct {
+	// Number is the field number from the tag.
+	Number protowire.Number
+	// WireType is the wire type from the tag.
+	WireType protowire.Type
+	// Value is the read-only wire encoding after the tag. It includes the
+	// length prefix for a length-delimited field and the end tag for a group.
+	Value []byte
+}
+
 // RawMessage holds the encoded bytes of one protobuf message.
 type RawMessage []byte
 
@@ -127,6 +139,37 @@ func (m RawMessage) DecodeField[T any](number int, dst *T) (bool, error) {
 	}
 	v.Set(value)
 	return true, nil
+}
+
+// Iter visits top-level field occurrences in wire order. Repeated occurrences
+// are yielded separately, and a packed field is one occurrence. Each call
+// to the iterator starts at the beginning of m. Field values borrow m's
+// bytes and share its lifetime. A parse error yields a zero Field and the
+// error, then stops.
+func (m RawMessage) Iter() iter.Seq2[Field, error] {
+	return func(yield func(Field, error) bool) {
+		for b := m; len(b) != 0; {
+			num, typ, n := protowire.ConsumeTag(b)
+			if n < 0 {
+				yield(Field{}, fmt.Errorf("protobuf: read field tag: %w", protowire.ParseError(n)))
+				return
+			}
+			if !num.IsValid() {
+				yield(Field{}, fmt.Errorf("protobuf: invalid field number %d", num))
+				return
+			}
+			b = b[n:]
+			n = protowire.ConsumeFieldValue(num, typ, b)
+			if n < 0 {
+				yield(Field{}, fmt.Errorf("protobuf: field %d: %w", num, protowire.ParseError(n)))
+				return
+			}
+			if !yield(Field{Number: num, WireType: typ, Value: b[:n:n]}, nil) {
+				return
+			}
+			b = b[n:]
+		}
+	}
 }
 
 var messageCache sync.Map // map[reflect.Type]*message
