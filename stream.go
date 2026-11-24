@@ -188,12 +188,35 @@ func (r *Reader) ReadRawTo(dst io.Writer) (int64, error) {
 	return c, nil
 }
 
-// RawMessages returns a single-use iterator over the remaining encoded records.
+// Iter returns a single-use iterator over the remaining records decoded into
+// values of T, which must be a named struct. The values remain valid after
+// subsequent reads. Restarting the iterator resumes at the reader's current
+// position. It stops at a clean EOF. On any other error, it yields the zero
+// value of T and the error from Read, then stops.
+func (r *Reader) Iter[T any]() iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		var v T
+		for {
+			if err := r.Read(&v); err != nil {
+				if err != io.EOF { //nolint:errorlint // A wrapped EOF is an input error and must reach the caller.
+					var zero T
+					yield(zero, err)
+				}
+				return
+			}
+			if !yield(v, nil) {
+				return
+			}
+		}
+	}
+}
+
+// IterRaw returns a single-use iterator over the remaining encoded records.
 // Restarting the iterator resumes at the reader's current position. Each
 // record is buffered in full and its bytes have the same lifetime as a result
 // of ReadRaw. It stops at a clean EOF. On any other error, it yields a nil
 // message and the error, then stops.
-func (r *Reader) RawMessages() iter.Seq2[RawMessage, error] {
+func (r *Reader) IterRaw() iter.Seq2[RawMessage, error] {
 	return func(yield func(RawMessage, error) bool) {
 		for {
 			b, err := r.ReadRaw()

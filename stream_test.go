@@ -332,17 +332,87 @@ func TestReader(t *testing.T) {
 			})
 		})
 	})
-	t.Run("RawMessages", func(t *testing.T) {
+	t.Run("Iter", func(t *testing.T) {
+		t.Parallel()
+		t.Run("valid", func(t *testing.T) {
+			t.Parallel()
+			r := NewReader(framedRecords([]byte{0x08, 7, 0x1a, 1, 'a'}, nil, []byte{0x08, 9, 0x1a, 1, 'b'}))
+			messages := r.Iter[streamEvent]()
+			var got []streamEvent
+			for v, err := range messages {
+				if err != nil {
+					t.Fatal(err)
+				}
+				got = append(got, v)
+				break
+			}
+			if len(got) != 1 {
+				t.Fatal("Iter did not yield the first record")
+			}
+			for v, err := range messages {
+				if err != nil {
+					t.Fatal(err)
+				}
+				got = append(got, v)
+			}
+			want := []streamEvent{{Seq: 7, Data: []byte("a")}, {}, {Seq: 9, Data: []byte("b")}}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("Iter yielded %#v, want %#v", got, want)
+			}
+		})
+		t.Run("error", func(t *testing.T) {
+			t.Parallel()
+			t.Run("decode error", func(t *testing.T) {
+				t.Parallel()
+				r := NewReader(framedRecords([]byte{0x08, 7}, []byte{0x08}, []byte{0x08, 9}))
+				var got []streamEvent
+				reported := false
+				for v, err := range r.Iter[streamEvent]() {
+					got = append(got, v)
+					if err != nil {
+						de, ok := errors.AsType[*DecodeError](err)
+						if reported || !ok || !bytes.Equal(de.Raw, []byte{0x08}) {
+							t.Fatalf("Iter yielded %v, want one DecodeError with raw byte 08", err)
+						}
+						reported = true
+					}
+				}
+				want := []streamEvent{{Seq: 7}, {}}
+				if !reported || !reflect.DeepEqual(got, want) {
+					t.Fatalf("Iter yielded %#v, DecodeError reported = %v, want %#v and a DecodeError", got, reported, want)
+				}
+				if v, err := r.ReadRaw(); err != nil || !bytes.Equal(v, []byte{0x08, 9}) {
+					t.Fatalf("ReadRaw after decode error = %x, %v, want 0809, nil", v, err)
+				}
+			})
+			t.Run("wrapped EOF", func(t *testing.T) {
+				t.Parallel()
+				wrapped := fmt.Errorf("read from storage: %w", io.EOF)
+				r := NewReader(readerFunc(func([]byte) (int, error) { return 0, wrapped }))
+				n := 0
+				for _, err := range r.Iter[streamEvent]() {
+					if n != 0 || !errors.Is(err, wrapped) {
+						t.Fatalf("Iter yielded %v, want %v once", err, wrapped)
+					}
+					n++
+				}
+				if n != 1 {
+					t.Fatalf("Iter yielded %d results, want one", n)
+				}
+			})
+		})
+	})
+	t.Run("IterRaw", func(t *testing.T) {
 		t.Parallel()
 		t.Run("valid", func(t *testing.T) {
 			t.Parallel()
 			first := []byte{0x08, 7}
 			r := NewReader(framedRecords(first, []byte{0x08, 9}, nil, []byte{0x80}))
-			messages := r.RawMessages()
+			messages := r.IterRaw()
 			var got streamEvent
 			for m, err := range messages {
 				if err != nil || !bytes.Equal(m, first) {
-					t.Fatalf("RawMessages yielded %x, %v, want first record %x", m, err, first)
+					t.Fatalf("IterRaw yielded %x, %v, want first record %x", m, err, first)
 				}
 				present, err := m.DecodeField(1, &got)
 				if err != nil || !present {
@@ -362,12 +432,12 @@ func TestReader(t *testing.T) {
 			n := 0
 			for m, err := range messages {
 				if err != nil || !bytes.Equal(m, []byte{0x80}) {
-					t.Fatalf("RawMessages yielded %x, %v, want the unparsed bytes 80", m, err)
+					t.Fatalf("IterRaw yielded %x, %v, want the unparsed bytes 80", m, err)
 				}
 				n++
 			}
 			if n != 1 {
-				t.Fatalf("RawMessages yielded %d messages, want one", n)
+				t.Fatalf("IterRaw yielded %d messages, want one", n)
 			}
 		})
 		t.Run("error", func(t *testing.T) {
@@ -383,14 +453,14 @@ func TestReader(t *testing.T) {
 				return src.Read(p)
 			}))
 			n := 0
-			for m, err := range r.RawMessages() {
+			for m, err := range r.IterRaw() {
 				if !errors.Is(err, wrapped) || m != nil {
-					t.Fatalf("RawMessages yielded %x, %v, want a nil message and %v", m, err, wrapped)
+					t.Fatalf("IterRaw yielded %x, %v, want a nil message and %v", m, err, wrapped)
 				}
 				n++
 			}
 			if n != 1 {
-				t.Fatalf("RawMessages yielded %d results, want one", n)
+				t.Fatalf("IterRaw yielded %d results, want one", n)
 			}
 			if got, err := r.ReadRaw(); err != nil || !bytes.Equal(got, []byte{0x08, 7}) {
 				t.Fatalf("ReadRaw after source error = %x, %v, want 0807, nil", got, err)

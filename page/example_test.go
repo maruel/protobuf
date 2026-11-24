@@ -53,12 +53,8 @@ func ExampleWriter() {
 		}
 	}()
 	r := protobuf.NewReader(pr)
-	for raw, err := range r.RawMessages() {
+	for event, err := range r.Iter[Event]() {
 		if err != nil {
-			panic(err)
-		}
-		var event Event
-		if err := raw.Decode(&event); err != nil {
 			panic(err)
 		}
 		fmt.Println(event.Sequence, event.Text)
