@@ -10,6 +10,8 @@ import (
 	"math"
 	"reflect"
 	"slices"
+
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 // Writer writes a stream of length-delimited protobuf records. Call its methods
@@ -21,7 +23,6 @@ type Writer struct {
 
 	schemas schemaCache
 	buf     []byte
-	prefix  [binary.MaxVarintLen32]byte
 }
 
 // NewWriter creates a writer over w, which must be non-nil.
@@ -33,6 +34,9 @@ func NewWriter(w io.Writer) *Writer {
 // validates the struct type and buffers the encoded message. An encoding
 // error leaves the destination untouched. A write error can leave a partial
 // record in the destination.
+//
+// On 32-bit Go, the payload and five bytes of prefix headroom must fit in a
+// single slice, limiting the payload to 2 GiB minus six bytes.
 func (w *Writer) Write[T any](v *T) error {
 	if v == nil {
 		return errors.New("protobuf: nil record")
@@ -41,19 +45,25 @@ func (w *Writer) Write[T any](v *T) error {
 	if err != nil {
 		return err
 	}
-	b, err := m.append(w.buf[:0], reflect.ValueOf(v).Elem(), 0)
+	const headroom = binary.MaxVarintLen32
+	const initialCapacity = 256
+	p := w.buf
+	if cap(p) < initialCapacity {
+		p = make([]byte, 0, initialCapacity)
+	}
+	b, err := m.append(p[:headroom], reflect.ValueOf(v).Elem(), 0)
 	if err != nil {
 		return err
 	}
-	if len(b) > maxRecordSize {
-		return fmt.Errorf("protobuf: record size %d exceeds %d bytes", len(b), maxRecordSize)
+	n := len(b) - headroom
+	if n > maxRecordSize {
+		return fmt.Errorf("protobuf: record size %d exceeds %d bytes", n, maxRecordSize)
 	}
+	size := uint64(n) //nolint:gosec // Appending the payload preserves the reserved headroom.
 	w.buf = b
-	p := binary.AppendUvarint(w.prefix[:0], uint64(len(b)))
-	if err := writeFull(w.Dst, p); err != nil || len(b) == 0 {
-		return err
-	}
-	return writeFull(w.Dst, b)
+	i := headroom - protowire.SizeVarint(size)
+	binary.PutUvarint(b[i:headroom], size)
+	return writeFull(w.Dst, b[i:])
 }
 
 // WriteRawFrom copies size bytes of an already encoded message from src
@@ -67,7 +77,10 @@ func (w *Writer) WriteRawFrom(src io.Reader, size int64) error {
 	if size < 0 || size > maxRecordSize {
 		return fmt.Errorf("protobuf: record size %d is outside 0..%d bytes", size, maxRecordSize)
 	}
-	p := binary.AppendUvarint(w.prefix[:0], uint64(size))
+	if cap(w.buf) < binary.MaxVarintLen32 {
+		w.buf = make([]byte, 0, binary.MaxVarintLen32)
+	}
+	p := binary.AppendUvarint(w.buf[:0], uint64(size))
 	if err := writeFull(w.Dst, p); err != nil || size == 0 {
 		return err
 	}

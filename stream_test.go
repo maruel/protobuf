@@ -29,7 +29,11 @@ func TestWriter(t *testing.T) {
 		t.Run("valid", func(t *testing.T) {
 			t.Parallel()
 			var dst bytes.Buffer
-			w := NewWriter(&dst)
+			calls := 0
+			w := NewWriter(writerFunc(func(p []byte) (int, error) {
+				calls++
+				return dst.Write(p)
+			}))
 			if err := w.Write(&streamEvent{Seq: 7, Text: "ok"}); err != nil {
 				t.Fatal(err)
 			}
@@ -39,12 +43,20 @@ func TestWriter(t *testing.T) {
 			if err := w.Write(&sequence{Number: 9}); err != nil {
 				t.Fatal(err)
 			}
+			data := bytes.Repeat([]byte{'x'}, 256)
+			if err := w.Write(&streamEvent{Data: data}); err != nil {
+				t.Fatal(err)
+			}
 			if err := w.Write(&streamEvent{}); err != nil {
 				t.Fatal(err)
 			}
-			want := []byte{6, 0x08, 7, 0x12, 2, 'o', 'k', 2, 0x08, 9, 0}
+			want := append([]byte{6, 0x08, 7, 0x12, 2, 'o', 'k', 2, 0x08, 9, 0x83, 2, 0x1a, 0x80, 2}, data...)
+			want = append(want, 0)
 			if !bytes.Equal(dst.Bytes(), want) {
 				t.Fatalf("written stream = %x, want %x", dst.Bytes(), want)
+			}
+			if calls != 4 {
+				t.Fatalf("destination received %d writes, want one per record", calls)
 			}
 		})
 		t.Run("error", func(t *testing.T) {
@@ -72,6 +84,9 @@ func TestWriter(t *testing.T) {
 			t.Parallel()
 			var dst bytes.Buffer
 			w := NewWriter(&dst)
+			if err := w.Write(&streamEvent{Seq: 5}); err != nil {
+				t.Fatal(err)
+			}
 			src := bytes.NewReader([]byte{0x08, 7, 0xff})
 			if err := w.WriteRawFrom(src, 2); err != nil {
 				t.Fatal(err)
@@ -80,7 +95,7 @@ func TestWriter(t *testing.T) {
 				t.Fatal(err)
 			}
 			p, err := src.ReadByte()
-			if p != 0xff || err != nil || !bytes.Equal(dst.Bytes(), []byte{2, 0x08, 7, 0}) {
+			if p != 0xff || err != nil || !bytes.Equal(dst.Bytes(), []byte{2, 0x08, 5, 2, 0x08, 7, 0}) {
 				t.Fatalf("stream = %x, trailing byte = %x, error = %v", dst.Bytes(), p, err)
 			}
 		})
